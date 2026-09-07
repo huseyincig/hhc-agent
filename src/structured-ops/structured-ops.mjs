@@ -118,6 +118,113 @@ export function makeStructuredHandlers({
         return fail(errorRecord?.message);
       }
     },
+    file_read_many: async (/** @type {unknown} */ job) => {
+      const jobRecord = /** @type {{request_payload?: unknown, payload?: unknown}} */ (job || {});
+      const p = /** @type {Record<string, unknown>} */ (
+        jobRecord.request_payload || jobRecord.payload || {}
+      );
+      try {
+        const rawPaths = Array.isArray(p.paths) ? p.paths : [];
+        if (rawPaths.length < 1 || rawPaths.length > 10) throw new Error('PATH_COUNT_INVALID');
+        const max = Math.max(1, Math.min(65536, Number(p.max_bytes || 65536)));
+        const roots = [...readRoots, ...policyExtraRoots(job).read];
+        const results = [];
+        for (const raw of rawPaths.slice(0, 10)) {
+          try {
+            const file = await realAllowed(String(raw || ''), roots),
+              b = await fs.readFile(file);
+            results.push({
+              path: file,
+              content: b.subarray(0, max).toString('utf8'),
+              bytes: b.length,
+              truncated: b.length > max,
+              error: null
+            });
+          } catch (e) {
+            const errorRecord = /** @type {{message?: unknown}} */ (e);
+            results.push({
+              path: String(raw || ''),
+              content: '',
+              bytes: 0,
+              truncated: false,
+              error: String(errorRecord?.message || e)
+            });
+          }
+        }
+        return ok({ results });
+      } catch (e) {
+        const errorRecord = /** @type {{message?: unknown}} */ (e);
+        return fail(errorRecord?.message);
+      }
+    },
+    file_stat: async (/** @type {unknown} */ job) => {
+      const jobRecord = /** @type {{request_payload?: unknown, payload?: unknown}} */ (job || {});
+      const p = /** @type {Record<string, unknown>} */ (
+        jobRecord.request_payload || jobRecord.payload || {}
+      );
+      try {
+        const roots = [...readRoots, ...policyExtraRoots(job).read];
+        const file = await realAllowed(String(p.path || ''), roots),
+          st = await fs.stat(file);
+        return ok({
+          path: file,
+          size_bytes: st.size,
+          mtime: st.mtime?.toISOString?.() || null,
+          mode: (st.mode & 0o777).toString(8),
+          is_directory: st.isDirectory()
+        });
+      } catch (e) {
+        const errorRecord = /** @type {{message?: unknown}} */ (e);
+        return fail(errorRecord?.message);
+      }
+    },
+    directory_tree: async (/** @type {unknown} */ job) => {
+      const jobRecord = /** @type {{request_payload?: unknown, payload?: unknown}} */ (job || {});
+      const p = /** @type {Record<string, unknown>} */ (
+        jobRecord.request_payload || jobRecord.payload || {}
+      );
+      try {
+        const roots = [...readRoots, ...policyExtraRoots(job).read];
+        const root = await realAllowed(String(p.path || ''), roots),
+          maxDepth = Math.max(1, Math.min(10, Number(p.max_depth ?? 5))),
+          maxEntries = Math.max(1, Math.min(2000, Number(p.max_entries ?? 500)));
+        /** @type {Array<{path: string, name: string, type: string, depth: number}>} */
+        const entries = [];
+        let truncated = false;
+        /** @param {string} dir @param {number} depth */
+        const walk = async (dir, depth) => {
+          if (depth > maxDepth || entries.length >= maxEntries) {
+            truncated = true;
+            return;
+          }
+          let rows;
+          try {
+            rows = await fs.readdir(dir, { withFileTypes: true });
+          } catch {
+            return;
+          }
+          for (const d of rows) {
+            if (entries.length >= maxEntries) {
+              truncated = true;
+              return;
+            }
+            const full = path.join(dir, d.name);
+            entries.push({
+              path: full,
+              name: d.name,
+              type: d.isDirectory() ? 'directory' : d.isFile() ? 'file' : 'other',
+              depth
+            });
+            if (d.isDirectory()) await walk(full, depth + 1);
+          }
+        };
+        await walk(root, 0);
+        return ok({ path: root, entries, truncated });
+      } catch (e) {
+        const errorRecord = /** @type {{message?: unknown}} */ (e);
+        return fail(errorRecord?.message);
+      }
+    },
     file_list: async (/** @type {unknown} */ job) => {
       const jobRecord = /** @type {{request_payload?: unknown, payload?: unknown}} */ (job || {});
       const p = /** @type {Record<string, unknown>} */ (

@@ -615,6 +615,56 @@ async function requirePolicy(policyGate, tool, payload, job) {
 }
 
 /**
+ * Surgical single-block edit with optimistic concurrency: the expected block
+ * must occur exactly once, and optional sha/mtime guards must still hold.
+ * @param {Record<string, unknown>} payload
+ * @param {object} [options]
+ * @param {Array<string>} [options.roots]
+ * @param {typeof import('node:fs/promises')} [options.fsApi]
+ * @param {typeof import('node:path')} [options.pathApi]
+ */
+export async function fileEditMutation(payload, { roots, fsApi = fs, pathApi = path } = {}) {
+  const expectedText = String(payload?.expected_text ?? '');
+  const replacementText = String(payload?.replacement_text ?? '');
+  if (!expectedText || expectedText.length > 65536 || replacementText.length > 65536)
+    err('EDIT_BLOCK_INVALID');
+  const expectedSha = validateSha(payload?.expected_sha256, hasOwn(payload, 'expected_sha256'));
+  const expectedMtime =
+    payload?.expected_mtime === undefined ? null : String(payload.expected_mtime);
+  const normalized = normalizeMutationPath(/** @type {string} */ (payload?.path), { pathApi });
+  return serialized(normCase(normalized, pathApi), async () => {
+    const options = { roots, fsApi, pathApi };
+    const leaf = await authorizeLeafParent(normalized, options);
+    rootTargetForbidden(normalized, leaf.real_roots, pathApi);
+    const st = await lstatOrNull(normalized, fsApi);
+    if (!st) err('FILE_NOT_FOUND');
+    if (st.isSymbolicLink()) err('PATH_SYMLINK_NOT_ALLOWED_FOR_WRITE');
+    if (!st.isFile()) err('PATH_TYPE_NOT_SUPPORTED');
+    if (expectedSha && (await shaFile(normalized, fsApi)) !== expectedSha)
+      err('FILE_SHA256_MISMATCH');
+    if (expectedMtime != null) {
+      const actual = [String(st.mtimeMs), st.mtime?.toISOString?.()].filter(Boolean);
+      if (!actual.includes(expectedMtime)) err('FILE_MTIME_MISMATCH');
+    }
+    const before = await fsApi.readFile(normalized, 'utf8');
+    const occurrences = before.split(expectedText).length - 1;
+    if (occurrences !== 1)
+      err(occurrences === 0 ? 'EXPECTED_TEXT_NOT_FOUND' : 'EXPECTED_TEXT_AMBIGUOUS');
+    const after = before.replace(expectedText, () => replacementText);
+    const tmp = normalized + `.hhc-edit-${Date.now()}-${Math.floor(Math.random() * 1e6)}.tmp`;
+    await fsApi.writeFile(tmp, after, { encoding: 'utf8', flag: 'wx' });
+    try {
+      await fsApi.rename(tmp, normalized);
+    } catch (e) {
+      try {
+        await fsApi.rm(tmp, { force: true });
+      } catch {}
+      throw e;
+    }
+    return { path: normalized };
+  });
+}
+/**
  * @param {object} [options]
  * @param {Array<string>} [options.writeRoots]
  * @param {(args: Record<string, unknown>) => unknown} [options.policyGate]
@@ -650,6 +700,7 @@ export function makeMutationHandlers({
   };
   return {
     file_write: wrap('file_write', fileWriteMutation),
+    file_edit: wrap('file_edit', fileEditMutation),
     directory_create: wrap('directory_create', directoryCreateMutation),
     file_move: wrap('file_move', fileMoveMutation),
     file_delete: wrap('file_delete', fileDeleteMutation)

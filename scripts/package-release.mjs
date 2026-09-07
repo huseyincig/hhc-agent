@@ -18,6 +18,13 @@ export const RUNTIME_FILES = Object.freeze([
   'singleton.mjs',
   'gui-launch.mjs',
   'browser-adapter.mjs',
+  'browser-manager.mjs',
+  'browser-jobs.mjs',
+  'browser-runtime.mjs',
+  'process-sessions.mjs',
+  'service-ops.mjs',
+  'log-ops.mjs',
+  'shell.mjs',
   'egress-policy.mjs',
   'client.mjs',
   'ws-client.mjs',
@@ -104,6 +111,13 @@ export const SOURCE_PATHS = Object.freeze({
   'singleton.mjs': 'src/client/singleton.mjs',
   'gui-launch.mjs': 'gui-broker/gui-launch.mjs',
   'browser-adapter.mjs': 'src/browser/browser-adapter.mjs',
+  'browser-manager.mjs': 'src/browser/browser-manager.mjs',
+  'browser-jobs.mjs': 'src/browser/browser-jobs.mjs',
+  'browser-runtime.mjs': 'src/browser/browser-runtime.mjs',
+  'process-sessions.mjs': 'src/process/process-sessions.mjs',
+  'service-ops.mjs': 'src/services/service-ops.mjs',
+  'log-ops.mjs': 'src/logs/log-ops.mjs',
+  'shell.mjs': 'src/shell/shell.mjs',
   'egress-policy.mjs': 'src/policy/egress-policy.mjs',
   'client.mjs': 'src/client/client.mjs',
   'ws-client.mjs': 'src/client/ws-client.mjs',
@@ -152,10 +166,110 @@ export async function generatedRuntimePackage(version) {
 }
 
 /**
+ * Reads the pinned Playwright version from the canonical agent source.
+ */
+export async function browserRuntimePin() {
+  const source = await fs.readFile(
+    path.join(AGENT_ROOT, 'src/browser/browser-runtime.mjs'),
+    'utf8'
+  );
+  const playwright = source.match(/playwright:\s*'([^']+)'/)?.[1];
+  const revision = source.match(/chromiumRevision:\s*'([^']+)'/)?.[1];
+  if (!playwright || !revision) throw new Error('BROWSER_RUNTIME_PIN_UNREADABLE');
+  return { playwright, chromiumRevision: revision };
+}
+
+/**
+ * Builds the versioned browser-runtime payload:
+ * <outputRoot>/<playwright>/browser-runtime.tar.gz containing top-level
+ * playwright-core/. Source: $HHC_BROWSER_RUNTIME_TGZ (offline/reproducible)
+ * or `npm pack playwright-core@<pin>` (network). Content-verified before
+ * acceptance; a mismatched payload fails the build, never the host.
+ * @param {object} [options]
+ * @param {string} [options.outputRoot]
+ * @param {boolean} [options.force]
+ * @param {string} [options.createdAt]
+ */
+export async function buildBrowserRuntime({
+  outputRoot = path.join(AGENT_ROOT, 'artifacts', 'browser-runtime'),
+  force = false,
+  createdAt = new Date().toISOString()
+} = {}) {
+  const pin = await browserRuntimePin();
+  const releaseDir = path.resolve(outputRoot, pin.playwright);
+  if (fsSync.existsSync(releaseDir)) {
+    if (!force) throw new Error(`BROWSER_RUNTIME_EXISTS:${releaseDir}`);
+    await fs.rm(releaseDir, { recursive: true, force: true });
+  }
+  await fs.mkdir(releaseDir, { recursive: true });
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), `hhc-browser-runtime-${pin.playwright}-`));
+  try {
+    let packed = process.env.HHC_BROWSER_RUNTIME_TGZ || '';
+    if (!packed) {
+      const pack = run('npm', ['pack', `playwright-core@${pin.playwright}`, '--pack-destination', temp]);
+      const file = pack.stdout
+        .split('\n')
+        .map((x) => x.trim())
+        .filter(Boolean)
+        .pop();
+      if (!file) throw new Error('BROWSER_RUNTIME_PACK_FAILED');
+      packed = path.resolve(temp, file);
+    } else if (!fsSync.existsSync(packed)) {
+      throw new Error(`BROWSER_RUNTIME_TGZ_MISSING:${packed}`);
+    }
+    const extractDir = path.join(temp, 'extract');
+    await fs.mkdir(extractDir, { recursive: true });
+    run('tar', ['-xzf', packed, '-C', extractDir]);
+    const coreDir = path.join(extractDir, 'package');
+    const pkg = JSON.parse(await fs.readFile(path.join(coreDir, 'package.json'), 'utf8'));
+    if (String(pkg.version || '') !== pin.playwright)
+      throw new Error(
+        `BROWSER_RUNTIME_VERSION_MISMATCH:expected=${pin.playwright}:got=${pkg.version || '?'}`
+      );
+    const browsers = JSON.parse(await fs.readFile(path.join(coreDir, 'browsers.json'), 'utf8'));
+    const chromium = (browsers?.browsers || []).find(
+      (/** @type {Record<string, unknown>} */ b) => b?.name === 'chromium'
+    );
+    if (String(chromium?.revision || '') !== pin.chromiumRevision)
+      throw new Error(
+        `BROWSER_RUNTIME_REVISION_MISMATCH:expected=${pin.chromiumRevision}:got=${chromium?.revision || '?'}`
+      );
+    if (!fsSync.existsSync(path.join(coreDir, 'cli.js')))
+      throw new Error('BROWSER_RUNTIME_NO_INSTALLER');
+    const stage = path.join(temp, 'stage', 'browser-runtime');
+    await fs.mkdir(stage, { recursive: true });
+    run('cp', ['-a', path.join(coreDir, '.'), path.join(stage, 'playwright-core')]);
+    const archive = await createDeterministicTarGzip(path.join(temp, 'stage'));
+    const outFile = path.join(releaseDir, 'browser-runtime.tar.gz');
+    await fs.writeFile(outFile, archive, { mode: 0o640 });
+    const manifest = {
+      playwright: pin.playwright,
+      chromium_revision: pin.chromiumRevision,
+      sha256: sha256(archive),
+      size_bytes: archive.length,
+      created_at: createdAt
+    };
+    await fs.writeFile(path.join(releaseDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { mode: 0o640 });
+    await fs.writeFile(
+      path.join(outputRoot, 'latest.json'),
+      JSON.stringify(manifest, null, 2) + '\n',
+      { mode: 0o640 }
+    );
+    return { releaseDir, manifest };
+  } catch (error) {
+    await fs.rm(releaseDir, { recursive: true, force: true });
+    throw error;
+  } finally {
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+}
+
+/**
  * @param {string} stage
  * @param {string} version
+ * @param {string|null} [browserRuntimeDir] prebuilt payload dir containing browser-runtime/
  */
-async function stageRuntime(stage, version) {
+async function stageRuntime(stage, version, browserRuntimeDir = null) {
   await fs.mkdir(stage, { recursive: true });
   for (const name of RUNTIME_FILES) {
     const dest = path.join(stage, name);
@@ -172,6 +286,17 @@ async function stageRuntime(stage, version) {
     await fs.copyFile(source, dest);
     await fs.chmod(dest, 0o640);
   }
+  // The browser runtime rides every agent release (fresh installs and OTA
+  // alike) so a pin change can never strand a host without its engine.
+  // Absent payload is legal for air-gapped rebuilds. NOTE: string-concat
+  // '/.' (path.join would normalize the dot away and nest the directory).
+  if (browserRuntimeDir) {
+    const source = path.join(browserRuntimeDir, 'browser-runtime');
+    mustFile(path.join(source, 'playwright-core', 'package.json'));
+    const target = path.join(stage, 'browser-runtime');
+    await fs.mkdir(target, { recursive: true });
+    run('cp', ['-a', source + '/.', target + '/.']);
+  }
   for (const name of RUNTIME_FILES.filter((x) => x.endsWith('.mjs'))) {
     run(process.execPath, ['--check', name], { cwd: stage });
   }
@@ -180,9 +305,10 @@ async function stageRuntime(stage, version) {
 /**
  * @param {string} stage
  * @param {string} version
+ * @param {string|null} [browserRuntimeDir] prebuilt payload dir containing browser-runtime/
  */
-async function stageBootstrap(stage, version) {
-  await stageRuntime(stage, version);
+async function stageBootstrap(stage, version, browserRuntimeDir = null) {
+  await stageRuntime(stage, version, browserRuntimeDir);
   for (const [sourceRel, targetRel] of BOOTSTRAP_MAPPINGS) {
     const source = path.join(AGENT_ROOT, sourceRel);
     const target = path.join(stage, targetRel);
@@ -214,10 +340,25 @@ function writeTarOctal(header, offset, length, value) {
  */
 function tarHeader(name, size, mode) {
   const normalized = String(name).replace(/\\/g, '/').replace(/^\.\//, '');
-  if (!normalized || Buffer.byteLength(normalized) > 100)
-    throw new Error('RELEASE_TAR_PATH_TOO_LONG:' + normalized);
+  if (!normalized) throw new Error('RELEASE_TAR_EMPTY_PATH');
+  // USTAR prefix splitting for payload paths beyond 100 bytes (vendored
+  // dependencies). The updater extractor already joins prefix/name.
+  let nameField = normalized;
+  let prefixField = '';
+  if (Buffer.byteLength(normalized) > 100) {
+    const idx = normalized.lastIndexOf('/', 100);
+    if (idx < 0) throw new Error('RELEASE_TAR_PATH_TOO_LONG:' + normalized);
+    prefixField = normalized.slice(0, idx);
+    nameField = normalized.slice(idx + 1);
+    if (
+      !nameField ||
+      Buffer.byteLength(nameField) > 100 ||
+      Buffer.byteLength(prefixField) > 155
+    )
+      throw new Error('RELEASE_TAR_PATH_TOO_LONG:' + normalized);
+  }
   const header = Buffer.alloc(512, 0);
-  header.write(normalized, 0, 100, 'utf8');
+  header.write(nameField, 0, 100, 'utf8');
   writeTarOctal(header, 100, 8, mode);
   writeTarOctal(header, 108, 8, 0);
   writeTarOctal(header, 116, 8, 0);
@@ -227,6 +368,7 @@ function tarHeader(name, size, mode) {
   header[156] = '0'.charCodeAt(0);
   header.write('ustar\0', 257, 6, 'ascii');
   header.write('00', 263, 2, 'ascii');
+  if (prefixField) header.write(prefixField, 345, 155, 'utf8');
   header.write('root', 265, 32, 'ascii');
   header.write('root', 297, 32, 'ascii');
   const checksum = header.reduce((sum, byte) => sum + byte, 0);
@@ -293,7 +435,8 @@ async function tarDirectory(stage, output) {
 export async function buildRelease({
   outputRoot = DEFAULT_OUTPUT_ROOT,
   force = false,
-  createdAt = new Date().toISOString()
+  createdAt = new Date().toISOString(),
+  browserRuntimeDir = null
 } = {}) {
   const agentPackage = JSON.parse(await fs.readFile(path.join(AGENT_ROOT, 'package.json'), 'utf8'));
   const version = String(agentPackage.version || '');
@@ -318,8 +461,8 @@ export async function buildRelease({
   try {
     const runtimeStage = path.join(temp, 'runtime');
     const bootstrapStage = path.join(temp, 'bootstrap');
-    await stageRuntime(runtimeStage, version);
-    await stageBootstrap(bootstrapStage, version);
+    await stageRuntime(runtimeStage, version, browserRuntimeDir);
+    await stageBootstrap(bootstrapStage, version, browserRuntimeDir);
 
     const runtimeArchive = path.join(releaseDir, 'client.tar.gz');
     const bootstrapArchive = path.join(releaseDir, 'bootstrap.tar.gz');
@@ -361,17 +504,33 @@ if (invoked) {
   const force = process.argv.includes('--force');
   const outputArg = process.argv.find((x) => x.startsWith('--output='));
   const outputRoot = outputArg ? outputArg.slice('--output='.length) : DEFAULT_OUTPUT_ROOT;
-  const result = await buildRelease({ outputRoot, force });
-  console.log(
-    JSON.stringify(
-      {
-        ok: true,
-        release_dir: result.releaseDir,
-        manifest: result.manifest,
-        published: false
-      },
-      null,
-      2
-    )
-  );
+  if (process.argv.includes('--browser-runtime')) {
+    const runtimeOut = process.argv
+      .find((x) => x.startsWith('--runtime-output='))
+      ?.slice('--runtime-output='.length);
+    const result = await buildBrowserRuntime({
+      ...(runtimeOut ? { outputRoot: runtimeOut } : {}),
+      force
+    });
+    console.log(JSON.stringify({ ok: true, release_dir: result.releaseDir, manifest: result.manifest }, null, 2));
+  } else {
+    const rtArg = process.argv.find((x) => x.startsWith('--with-browser-runtime='));
+    const result = await buildRelease({
+      outputRoot,
+      force,
+      ...(rtArg ? { browserRuntimeDir: rtArg.slice('--with-browser-runtime='.length) } : {})
+    });
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          release_dir: result.releaseDir,
+          manifest: result.manifest,
+          published: false
+        },
+        null,
+        2
+      )
+    );
+  }
 }

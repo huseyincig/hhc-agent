@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.44 — 2026-09-07
+
+- Playwright browser subsystem (contract 5.4.0): vendored `playwright-core`
+  1.63.0 + HHC-managed Chromium r1243 under the data dir; per-`browser_id`
+  isolated contexts with TTL sweep; stable refs with `BROWSER_STALE_TARGET`;
+  `browser_find`, tabs, screenshots, console/network diagnostics,
+  policy-gated uploads/downloads/evaluate; secret redaction; startup health
+  gate; OTA staged runtime with boot promotion and background binary
+  convergence. New: `src/browser/browser-{runtime,manager,jobs}.mjs`.
+- Process/service/log sessions: `src/process/process-sessions.mjs`,
+  `src/services/service-ops.mjs`, `src/logs/log-ops.mjs`; `file_edit`,
+  `file_read_many/stat`, `directory_tree` handlers.
+- Policy: `browser_uploads/downloads/existing_attach/headed` (deny by
+  default), `browser_policy_v2` feature tier.
+- Packaging fix: `shell.mjs` is now in `RUNTIME_FILES`/`SOURCE_PATHS` and
+  all installers (previously omitted — staged releases would fail to load).
+- Installer/OTA: versioned browser-runtime payload, staged validated
+  installs, `BROWSER_READY` reporting; USTAR prefix support in packager.
+
 ## Unreleased
 
 - `executeShellJob` extracted from `src/client/client.mjs` to

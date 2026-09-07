@@ -4,17 +4,24 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
 import { hhcLayout } from '../client/hhc-paths.mjs';
+import { resolveBrowserRuntime, stageBrowserInstall } from '../browser/browser-runtime.mjs';
 
 export const REQUIRED_UPDATE_FILES = [
   'launcher.mjs',
   'singleton.mjs',
   'gui-launch.mjs',
   'browser-adapter.mjs',
+  'browser-manager.mjs',
+  'browser-jobs.mjs',
+  'browser-runtime.mjs',
   'egress-policy.mjs',
   'client.mjs',
   'ws-client.mjs',
   'structured-ops.mjs',
   'mutation-ops.mjs',
+  'process-sessions.mjs',
+  'service-ops.mjs',
+  'log-ops.mjs',
   'host-policy.mjs',
   'device-proof.mjs',
   'lifecycle.mjs',
@@ -216,6 +223,39 @@ export function makeUpdateHandler(options) {
       if (pkg.version !== version) throw new Error('UPDATE_VERSION_MISMATCH');
       for (const name of REQUIRED.filter((x) => x.endsWith('.mjs')))
         await run(process.execPath, ['--check', name], stage);
+      // Bundled browser runtime (when the release carries one) must agree
+      // with the staged code pin; a mismatched bundle fails the update
+      // instead of stranding the host with a dead engine. Absent bundle is
+      // legal (air-gapped rebuilds fall back to the standalone OTA path).
+      if (await exists(path.join(stage, 'browser-runtime', 'playwright-core', 'package.json'))) {
+        const bundledPkg = JSON.parse(
+          await fs.readFile(path.join(stage, 'browser-runtime', 'playwright-core', 'package.json'), 'utf8')
+        );
+        const stagedPin = await fs.readFile(path.join(stage, 'browser-runtime.mjs'), 'utf8');
+        const pinVersion = stagedPin.match(/playwright:\s*'([^']+)'/)?.[1];
+        if (!pinVersion || String(bundledPkg.version || '') !== pinVersion)
+          throw new Error('UPDATE_BROWSER_RUNTIME_MISMATCH');
+      }
+      // Browser runtime stages alongside the core update (never blocks it):
+      // boot promotion converges both atomically across the restart.
+      /** @type {{staged: boolean, error?: string, current?: boolean, playwright?: string, browsers?: string|null}} */
+      let browserRuntime = { staged: false };
+      if (p.browser_runtime && typeof p.browser_runtime === 'object') {
+        try {
+          browserRuntime = await stageBrowserRuntimeUpdate({
+            serverUrl,
+            authHeaders,
+            layout,
+            spec: p.browser_runtime
+          });
+        } catch (error) {
+          const message =
+            error && typeof error === 'object' && 'message' in error && error.message
+              ? String(error.message)
+              : String(error);
+          browserRuntime = { staged: false, error: message };
+        }
+      }
       return {
         status: 'completed',
         exit_code: 0,
@@ -223,7 +263,13 @@ export function makeUpdateHandler(options) {
         stderr: '',
         error: null,
         duration_ms: 0,
-        result_payload: { version, sha256: expected, stage_dir: stage, activation_pending: true }
+        result_payload: {
+          version,
+          sha256: expected,
+          stage_dir: stage,
+          activation_pending: true,
+          browser_runtime_staged: browserRuntime
+        }
       };
     } catch (error) {
       const message =
@@ -266,6 +312,72 @@ export async function swapAppContents(stage, { layout = hhcLayout(), previous } 
     await moveDirContents(previous, layout.app);
     throw error;
   }
+}
+
+/**
+ * Stages a browser-runtime OTA payload next to (never inside) the live
+ * runtime. The staged payload activates at boot only when its Playwright
+ * version equals the running code pin, so a core update and its runtime
+ * converge atomically across the restart. Staging failure never blocks the
+ * core update: the new code boots with the previous runtime and the health
+ * gate hides browser tools with a clear mismatch error instead.
+ * @param {object} options
+ * @param {string} options.serverUrl
+ * @param {unknown} options.authHeaders
+ * @param {ReturnType<typeof import('../client/hhc-paths.mjs').hhcLayout>} options.layout
+ * @param {unknown} options.spec
+ */
+export async function stageBrowserRuntimeUpdate({ serverUrl, authHeaders, layout, spec }) {
+  const rec = /** @type {Record<string, unknown>} */ (spec && typeof spec === 'object' ? spec : {});
+  const playwright = String(rec.playwright || '');
+  const expected = String(rec.sha256 || '').toLowerCase();
+  const packageUrl = String(rec.package_url || '');
+  if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(playwright))
+    return { staged: false, error: 'INVALID_BROWSER_RUNTIME_VERSION' };
+  if (!/^[a-f0-9]{64}$/.test(expected)) return { staged: false, error: 'INVALID_UPDATE_SHA256' };
+  if (!packageUrl.startsWith('/')) return { staged: false, error: 'INVALID_UPDATE_URL' };
+  const rt = resolveBrowserRuntime({ root: layout.root });
+  // Fast path: the live runtime already satisfies the offered pin.
+  try {
+    const livePkg = JSON.parse(
+      (await fs.readFile(path.join(rt.coreDir, 'package.json'), 'utf8')).toString()
+    );
+    if (String(livePkg.version || '') === playwright) return { staged: false, current: true };
+  } catch {}
+  if (typeof authHeaders !== 'function') throw new Error('DEVICE_AUTH_REQUIRED');
+  const requestUrl = serverUrl + packageUrl;
+  const headers = await authHeaders('GET', requestUrl, { json: false });
+  const r = await fetch(requestUrl, { headers, signal: AbortSignal.timeout(120000) });
+  if (!r.ok) throw new Error(`UPDATE_DOWNLOAD_HTTP_${r.status}`);
+  const body = Buffer.from(await r.arrayBuffer());
+  if (sha256(body) !== expected) throw new Error('UPDATE_SHA256_MISMATCH');
+  const staged = path.join(rt.base, 'browser-runtime.staging');
+  await fs.rm(staged, { recursive: true, force: true });
+  const tmpExtract = `${staged}.extract`;
+  await fs.rm(tmpExtract, { recursive: true, force: true });
+  try {
+    await extractReleaseArchive(body, tmpExtract);
+    // Payload archives carry a top-level browser-runtime/ dir; the staging
+    // area mirrors the live layout (playwright-core/ directly inside).
+    await fs.rename(path.join(tmpExtract, 'browser-runtime'), staged);
+  } finally {
+    await fs.rm(tmpExtract, { recursive: true, force: true });
+  }
+  const stagedPkg = JSON.parse(
+    await fs.readFile(path.join(staged, 'playwright-core', 'package.json'), 'utf8')
+  );
+  if (String(stagedPkg.version || '') !== playwright) throw new Error('UPDATE_VERSION_MISMATCH');
+  // Browsers stage alongside (no OS-deps at OTA time — installer-only),
+  // without promoting: boot promotion validates before touching live paths.
+  const browsers = await stageBrowserInstall({
+    coreDir: path.join(staged, 'playwright-core'),
+    browsersDir: rt.browsersDir,
+    stagingDir: rt.stagingDir,
+    withDeps: false,
+    promote: false
+  });
+  if (!browsers.ok) throw new Error(browsers.error || 'BROWSER_INSTALLATION_MISSING');
+  return { staged: true, playwright, browsers: browsers.revision || null };
 }
 
 /**

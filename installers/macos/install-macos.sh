@@ -69,7 +69,7 @@ if [ -f "$ROOT/config/hhc-device-key.pem" ]; then
   chown "$USER_NAME:$GROUP_NAME" "$ROOT/config/hhc-device-key.pem"
   chmod 0600 "$ROOT/config/hhc-device-key.pem"
 fi
-RUNTIME=(launcher.mjs singleton.mjs gui-launch.mjs browser-adapter.mjs egress-policy.mjs client.mjs ws-client.mjs structured-ops.mjs mutation-ops.mjs host-policy.mjs device-proof.mjs lifecycle.mjs updater.mjs hhc-paths.mjs privileged-helper-contract.mjs privileged-helper-core.mjs privileged-helper-ipc.mjs linux-peer-credentials.mjs privileged-helper-linux-daemon.mjs privileged-helper-linux-operations.mjs privileged-helper-bootstrap.mjs privileged-helper-client.mjs privileged-helper-linux-readiness.mjs package.json)
+RUNTIME=(launcher.mjs singleton.mjs gui-launch.mjs browser-adapter.mjs browser-manager.mjs browser-jobs.mjs browser-runtime.mjs process-sessions.mjs service-ops.mjs log-ops.mjs shell.mjs egress-policy.mjs client.mjs ws-client.mjs structured-ops.mjs mutation-ops.mjs host-policy.mjs device-proof.mjs lifecycle.mjs updater.mjs hhc-paths.mjs privileged-helper-contract.mjs privileged-helper-core.mjs privileged-helper-ipc.mjs linux-peer-credentials.mjs privileged-helper-linux-daemon.mjs privileged-helper-linux-operations.mjs privileged-helper-bootstrap.mjs privileged-helper-client.mjs privileged-helper-linux-readiness.mjs package.json)
 NEW="$ROOT/tmp/app-new-$STAMP"
 install -d -m 0750 -o "$USER_NAME" -g "$GROUP_NAME" "$NEW"
 for f in "${RUNTIME[@]}"; do
@@ -113,6 +113,46 @@ migrate_one "$ROOT/data/client-state.json" "$SRC/state.json" /usr/local/hhc/stat
 migrate_one "$ROOT/logs/client.log" "$SRC/client.log" /usr/local/hhc/client.log /opt/hhc-client/client.log
 migrate_one "$ROOT/logs/audit.jsonl" "$SRC/audit.jsonl" /usr/local/hhc/audit.jsonl /opt/hhc-client/audit.jsonl
 chown -R "$USER_NAME:$GROUP_NAME" "$ROOT/config" "$ROOT/data" "$ROOT/logs" "$ROOT/releases" "$ROOT/backups" "$ROOT/tmp"
+
+# Provision the managed browser runtime (Playwright + HHC-managed Chromium).
+# Optional: BROWSER_READY=0 when the payload is absent or the install fails.
+# No OS-dependency step on macOS; the client health gate hides browser tools
+# until the runtime is present.
+BROWSER_READY=0
+BROWSER_SRC="$SRC/browser-runtime"
+BROWSER_BASE="$ROOT/data/browser"
+BROWSER_RT="$BROWSER_BASE/browser-runtime"
+BROWSER_BROWSERS="$BROWSER_BASE/playwright-browsers"
+if [ -f "$BROWSER_SRC/playwright-core/package.json" ] && [ -f "$BROWSER_SRC/playwright-core/cli.js" ]; then
+  PIN_VERSION="$("$NODE_BIN" -e "import('file://$ROOT/app/browser-runtime.mjs').then((m) => console.log(m.BROWSER_RUNTIME_PIN.playwright))" 2>/dev/null || true)"
+  RT_VERSION="$("$NODE_BIN" -p "require('$BROWSER_SRC/playwright-core/package.json').version" 2>/dev/null || true)"
+  if [ -n "$PIN_VERSION" ] && [ "$PIN_VERSION" = "$RT_VERSION" ]; then
+    rm -rf "$BROWSER_RT.new"
+    install -d -m 0700 -o "$USER_NAME" -g "$GROUP_NAME" "$BROWSER_BASE"
+    cp -a "$BROWSER_SRC" "$BROWSER_RT.new"
+    chown -R "$USER_NAME:$GROUP_NAME" "$BROWSER_RT.new"
+    rm -rf "$BROWSER_RT"
+    mv "$BROWSER_RT.new" "$BROWSER_RT"
+    if PLAYWRIGHT_BROWSERS_PATH="$BROWSER_BROWSERS" "$NODE_BIN" "$BROWSER_RT/playwright-core/cli.js" install chromium >/dev/null 2>&1; then
+      _chromium_present=0
+      for _rev in "$BROWSER_BROWSERS"/chromium-*; do
+        [ -d "$_rev" ] && { _chromium_present=1; break; }
+      done
+      if [ "$_chromium_present" -eq 1 ]; then
+        chown -R "$USER_NAME:$GROUP_NAME" "$BROWSER_BROWSERS"
+        BROWSER_READY=1
+      else
+        echo 'Warning: managed Chromium revision missing after install; browser tools unavailable.' >&2
+      fi
+    else
+      echo 'Warning: managed Chromium install failed (offline?); browser tools unavailable until installed.' >&2
+    fi
+  else
+    echo "Warning: browser-runtime payload version ($RT_VERSION) does not match client pin ($PIN_VERSION); skipping browser install." >&2
+  fi
+else
+  echo 'Warning: no browser-runtime payload in bootstrap; browser tools unavailable until OTA delivers it.' >&2
+fi
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -135,4 +175,8 @@ launchctl bootstrap system "$PLIST"
 launchctl enable system/com.hhc.client
 sleep 2
 launchctl print system/com.hhc.client >/dev/null
-printf 'HHC canonical install complete: %s\n' "$ROOT"
+if [ "$BROWSER_READY" -eq 1 ]; then
+  printf 'HHC canonical install complete: %s (managed browser runtime ready)\n' "$ROOT"
+else
+  printf 'HHC canonical install complete: %s (managed browser runtime NOT ready; browser tools hidden until installed)\n' "$ROOT"
+fi

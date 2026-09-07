@@ -1,6 +1,6 @@
 {
   "name": "@hhc/agent",
-  "version": "0.4.41",
+  "version": "0.4.44",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node src/client/launcher.mjs",
-    "package": "node scripts/package-release.mjs"
+    "package": "node scripts/package-release.mjs",
+    "test": "node --test tests/*.mjs"
   }
 }

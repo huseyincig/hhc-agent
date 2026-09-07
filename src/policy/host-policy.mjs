@@ -3,12 +3,17 @@ import crypto from 'node:crypto';
 export const HOST_POLICY_CONTRACT_VERSION = '1.0.0';
 export const HOST_POLICY_FEATURE = 'host_policy_v1';
 export const BROWSER_POLICY_FEATURE = 'browser_policy_v1';
+export const BROWSER_POLICY_V2_FEATURE = 'browser_policy_v2';
 export const WORKSPACE_ROOTS_FEATURE = 'workspace_roots_v1';
 
 export const HOST_POLICY_CAPABILITIES = Object.freeze([
   'automatic_client_updates',
+  'browser_downloads',
+  'browser_existing_attach',
+  'browser_headed',
   'browser_private_network',
   'browser_script_exec',
+  'browser_uploads',
   'directory_manage',
   'file_delete',
   'file_move',
@@ -148,15 +153,46 @@ export function requiredCapabilitiesForOperation(tool, payload = {}, origin = 'm
     browser_interact: ['gui_launch'],
     browser_snapshot: ['gui_launch'],
     shell_exec: ['shell_exec'],
+    file_read_many: ['file_read'],
+    file_stat: ['file_read'],
+    directory_tree: ['file_read'],
+    file_edit: ['file_write'],
+    process_start: ['shell_exec'],
+    process_output: ['shell_exec'],
+    process_input: ['shell_exec'],
+    process_list: ['shell_exec'],
+    process_terminate: ['shell_exec'],
+    service_list: ['service_status'],
+    service_start: ['service_control'],
+    service_stop: ['service_control'],
+    service_restart: ['service_control'],
+    log_follow_start: ['log_read'],
+    log_follow_read: ['log_read'],
+    log_follow_stop: ['log_read'],
+    browser_create: ['gui_launch'],
+    browser_close: ['gui_launch'],
+    browser_find: ['gui_launch'],
+    browser_tabs: ['gui_launch'],
+    browser_take_screenshot: ['gui_launch'],
+    browser_console_messages: ['gui_launch'],
+    browser_network_requests: ['gui_launch'],
+    browser_file_upload: ['gui_launch'],
     privileged_shell_exec: ['privileged_exec', 'shell_exec'],
-    directory_create: ['directory_manage'],
-    process_list: ['process_inspect'],
-    process_inspect: ['process_inspect'],
-    process_kill: ['process_terminate'],
-    process_terminate: ['process_terminate'],
-    service_control: ['service_control'],
-    package_management: ['package_management']
+    directory_create: ['directory_manage']
   };
+  if (tool === 'browser_create') {
+    const out = new Set(['gui_launch']);
+    if (String(payload?.mode || 'managed').toLowerCase() === 'existing')
+      out.add('browser_existing_attach');
+    if (payload?.headless === false) out.add('browser_headed');
+    return [...out].sort();
+  }
+  if (tool === 'browser_interact') {
+    const action = String(payload?.action || '').toLowerCase();
+    if (action === 'evaluate') return ['browser_script_exec', 'gui_launch'].sort();
+    return ['gui_launch'];
+  }
+  if (tool === 'browser_file_upload') return ['browser_uploads', 'gui_launch'].sort();
   if (tool === 'file_write')
     return [
       ...new Set(['file_write', ...(payload.create_parents === true ? ['directory_manage'] : [])])
@@ -245,9 +281,10 @@ export function authorizeBoundJob(job, currentPolicy, { transportProtected = fal
     expected.length === 0;
   // client_uninstall carries empty capabilities by contract (mirrors the
   // central admission exemption and planClientUninstallAuthorization).
+  // 'mcp' origin mirrors the dispatcher mcp:admin scope gate.
   const adminUninstallException =
     job?.tool === 'client_uninstall' &&
-    binding.admission_origin === 'admin_api' &&
+    (binding.admission_origin === 'admin_api' || binding.admission_origin === 'mcp') &&
     expected.length === 0;
   const boundCaps = binding.required_capabilities;
   if (

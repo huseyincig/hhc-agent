@@ -17,6 +17,7 @@ import { hhcLayout } from './hhc-paths.mjs';
 import {
   HOST_POLICY_FEATURE,
   BROWSER_POLICY_FEATURE,
+  BROWSER_POLICY_V2_FEATURE,
   WORKSPACE_ROOTS_FEATURE,
   authorizeBoundJob,
   policyBindingFromJob,
@@ -30,11 +31,28 @@ import {
   observeRetirementResponse
 } from '../lifecycle/lifecycle.mjs';
 import { makePrivilegedHelperClientHandler } from '../../privileged-helper/privileged-helper-client.mjs';
+import { browserAuditSummary } from '../browser/browser-manager.mjs';
 import { linuxPrivilegedHelperReadiness } from '../../privileged-helper/privileged-helper-linux-readiness.mjs';
-import { browserNavigateJob, browserInteractJob, browserSnapshotJob } from '../browser/browser-adapter.mjs';
+import {
+  browserNavigateJob,
+  browserInteractJob,
+  browserSnapshotJob,
+  browserCreateJob,
+  browserCloseJob,
+  browserFindJob,
+  browserTabsJob,
+  browserScreenshotJob,
+  browserConsoleJob,
+  browserNetworkJob,
+  browserUploadJob,
+  browserHealth
+} from '../browser/browser-adapter.mjs';
+import { makeProcessHandlers } from '../process/process-sessions.mjs';
+import { makeServiceHandlers } from '../services/service-ops.mjs';
+import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.41';
+const VERSION = '0.4.44';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),
@@ -307,6 +325,9 @@ export function localAuditPayload(op, payload = {}, result = {}) {
             : null,
       recursive: payload.recursive === true
     };
+  }
+  if (typeof op === 'string' && op.startsWith('browser_')) {
+    return browserAuditSummary(op, payload, result);
   }
   return payload;
 }
@@ -643,7 +664,9 @@ function systemPayload() {
       filesystem_layout: filesystemLayoutMetadata(),
       transport: liveSession ? 'websocket' : 'http-poll',
       protocol_version: cfg.protocolVersion,
-      capabilities: Object.keys(getHandlers()).sort()
+      capabilities: advertisedCapabilities(),
+      // Browser-runtime telemetry for OTA pin decisions and bug reports.
+      browser_runtime: { ...browserHealthCache }
     }
   };
 }
@@ -685,7 +708,7 @@ async function heartbeat() {
       log_delivery: 'on_demand',
       transport: liveSession ? 'websocket' : 'http-poll',
       protocol_version: cfg.protocolVersion,
-      capabilities: Object.keys(getHandlers()).sort(),
+      capabilities: advertisedCapabilities(),
       filesystem_layout: filesystemLayoutMetadata()
     }
   });
@@ -936,13 +959,59 @@ function mutationPolicyGate({ capabilities, policy_identity } = {}) {
 }
 
 /**
+ * Browser capability is advertised only when the startup health gate passed
+ * (playwright-core import + pin + managed Chromium present). A missing or
+ * mismatched runtime hides every browser_* tool instead of failing at call
+ * time. Full launch validation runs on first browser_create and is cached.
+ * @returns {Array<string>}
+ */
+export function advertisedCapabilities() {
+  const all = Object.keys(getHandlers()).sort();
+  if (browserHealthCache.available) return all;
+  return all.filter((c) => !c.startsWith('browser_'));
+}
+/** @type {{checked: boolean, available: boolean, error: string|null, playwright: string|null, revision: string|null}} */
+export const browserHealthCache = {
+  checked: false,
+  available: false,
+  error: 'BROWSER_HEALTH_NOT_CHECKED',
+  playwright: null,
+  revision: null
+};
+
+/** Runs the lightweight startup browser health gate (no browser launch). */
+export async function refreshBrowserHealth() {
+  try {
+    const h = await browserHealth();
+    browserHealthCache.checked = true;
+    browserHealthCache.available = h.available === true;
+    browserHealthCache.error = h.available ? null : String(h.error || 'BROWSER_NOT_AVAILABLE');
+    browserHealthCache.playwright = h.playwright || null;
+    browserHealthCache.revision = h.revision || null;
+  } catch {
+    browserHealthCache.checked = true;
+    browserHealthCache.available = false;
+    browserHealthCache.error = 'BROWSER_NOT_AVAILABLE';
+    browserHealthCache.playwright = null;
+    browserHealthCache.revision = null;
+  }
+  return { ...browserHealthCache };
+}
+/**
  * @returns {Record<string, (job: Record<string, unknown>, options?: Record<string, unknown>) => Promise<Record<string, unknown>>>}
  */
 export function getHandlers() {
   if (handlerRegistry) return handlerRegistry;
   const options = { readRoots: cfg.readRoots, serviceUnits: cfg.serviceStatusUnits },
     base = makeStructuredHandlers(options),
-    mutations = makeMutationHandlers({ writeRoots: [layout.root], policyGate: mutationPolicyGate });
+    mutations = makeMutationHandlers({ writeRoots: [layout.root], policyGate: mutationPolicyGate }),
+    processes = makeProcessHandlers(),
+    services = makeServiceHandlers(),
+    logFollow = makeLogFollowHandlers({
+      logSources: Object.fromEntries(
+        Object.entries(LOG_SOURCES).filter(([, v]) => typeof v === 'string' && v)
+      )
+    });
   const privilegedHelperAvailable = () => {
     if (process.platform !== 'linux') return false;
     try {
@@ -971,6 +1040,17 @@ export function getHandlers() {
       browser_navigate: browserNavigateJob,
       browser_interact: browserInteractJob,
       browser_snapshot: browserSnapshotJob,
+      browser_create: browserCreateJob,
+      browser_close: browserCloseJob,
+      browser_find: browserFindJob,
+      browser_tabs: browserTabsJob,
+      browser_take_screenshot: browserScreenshotJob,
+      browser_console_messages: browserConsoleJob,
+      browser_network_requests: browserNetworkJob,
+      browser_file_upload: browserUploadJob,
+      ...processes,
+      ...services,
+      ...logFollow,
       ...(process.platform === 'linux'
         ? {
             privileged_shell_exec: makePrivilegedHelperClientHandler({
@@ -1186,10 +1266,11 @@ function sessionHello() {
       cpus: p.metadata.cpus,
       total_memory_bytes: p.metadata.total_memory_bytes
     },
-    capabilities: Object.keys(getHandlers()).sort(),
+    capabilities: advertisedCapabilities(),
     features: [
       HOST_POLICY_FEATURE,
       BROWSER_POLICY_FEATURE,
+      BROWSER_POLICY_V2_FEATURE,
       WORKSPACE_ROOTS_FEATURE,
       ...(Object.hasOwn(getHandlers(), 'privileged_shell_exec') ? ['privileged_helper_v1'] : [])
     ],
@@ -1542,6 +1623,30 @@ export async function main() {
   await fs.writeFile(layout.pidFile, String(process.pid) + '\n', { mode: 0o640 });
   const state = await readState();
   if (markInterruptedJobs(state)) await writeState(state);
+  try {
+    const {
+      activateStagedBrowserRuntime,
+      activateBundledBrowserRuntime,
+      resolveBrowserRuntime
+    } = await import('../browser/browser-runtime.mjs');
+    const rtBase = resolveBrowserRuntime({ root: layout.root }).base;
+    const bundled = await activateBundledBrowserRuntime({
+      appDir: path.dirname(process.argv[1] || ''),
+      base: rtBase
+    });
+    const promoted = await activateStagedBrowserRuntime(rtBase);
+    await log('info', 'browser_runtime_promotion', { bundled, staged: promoted });
+    // Converge the Chromium binary in the background (see
+    // ensureManagedBrowsers): boot and hello never wait for the download.
+    import('../browser/browser-runtime.mjs')
+      .then((m) => m.ensureManagedBrowsers(rtBase))
+      .then((r) => log('info', 'browser_binary_convergence', { ...r }))
+      .catch(() => {});
+  } catch {}
+  try {
+    await refreshBrowserHealth();
+  } catch {}
+  await log('info', 'browser_health', { ...browserHealthCache });
   await log('info', 'hhc-client starting', {
     server: cfg.serverUrl,
     client_id: cfg.clientId,
@@ -1550,7 +1655,7 @@ export async function main() {
     token_configured: Boolean(cfg.clientToken),
     session_enabled: cfg.sessionEnabled,
     protocol_version: cfg.protocolVersion,
-    capabilities: Object.keys(getHandlers()).sort(),
+    capabilities: advertisedCapabilities(),
     filesystem_root: layout.root,
     runtime_app_dir: path.dirname(process.argv[1] || '')
   });

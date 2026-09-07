@@ -13,7 +13,7 @@ if ($Major -lt 22) { throw 'Node.js 22+ required' }
 $Dirs = @('app','config','data','logs','releases','backups','tmp')
 $Supervisor = Join-Path $Root 'hhc-supervisor.ps1'
 foreach ($d in $Dirs) { New-Item -ItemType Directory -Force -Path (Join-Path $Root $d) | Out-Null }
-$Runtime = @('launcher.mjs','singleton.mjs','gui-launch.mjs','browser-adapter.mjs','egress-policy.mjs','client.mjs','ws-client.mjs','structured-ops.mjs','mutation-ops.mjs','host-policy.mjs','device-proof.mjs','lifecycle.mjs','updater.mjs','hhc-paths.mjs','privileged-helper-contract.mjs','privileged-helper-core.mjs','privileged-helper-ipc.mjs','linux-peer-credentials.mjs','privileged-helper-linux-daemon.mjs','privileged-helper-linux-operations.mjs','privileged-helper-bootstrap.mjs','privileged-helper-client.mjs','privileged-helper-linux-readiness.mjs','package.json')
+$Runtime = @('launcher.mjs','singleton.mjs','gui-launch.mjs','browser-adapter.mjs','browser-manager.mjs','browser-jobs.mjs','browser-runtime.mjs','egress-policy.mjs','client.mjs','ws-client.mjs','structured-ops.mjs','mutation-ops.mjs','process-sessions.mjs','service-ops.mjs','log-ops.mjs','shell.mjs','host-policy.mjs','device-proof.mjs','lifecycle.mjs','updater.mjs','hhc-paths.mjs','privileged-helper-contract.mjs','privileged-helper-core.mjs','privileged-helper-ipc.mjs','linux-peer-credentials.mjs','privileged-helper-linux-daemon.mjs','privileged-helper-linux-operations.mjs','privileged-helper-bootstrap.mjs','privileged-helper-client.mjs','privileged-helper-linux-readiness.mjs','package.json')
 $New = Join-Path $Root "tmp\app-new-$Stamp"
 New-Item -ItemType Directory -Force -Path $New | Out-Null
 foreach ($f in $Runtime) {
@@ -172,4 +172,43 @@ if (-not $RuntimeReady) {
   if (Test-Path -LiteralPath $ClientLog) { Get-Content -LiteralPath $ClientLog -Tail 30 | Out-Host }
   throw "HHC runtime failed to start release $ExpectedVersion"
 }
-Write-Host "HHC canonical install complete: $Root"
+# Provision the managed browser runtime (Playwright + HHC-managed Chromium).
+# Optional: BROWSER_READY stays false when the payload is absent or the
+# install fails. No OS-dependency step on Windows; the client health gate
+# hides browser tools until the runtime is present.
+$BrowserReady = $false
+$BrowserSrc = Join-Path $Src 'browser-runtime'
+$BrowserBase = Join-Path $Root 'data\browser'
+$BrowserRt = Join-Path $BrowserBase 'browser-runtime'
+$BrowserBrowsers = Join-Path $BrowserBase 'playwright-browsers'
+$RtPkg = Join-Path $BrowserSrc 'playwright-core\package.json'
+$RtCli = Join-Path $BrowserSrc 'playwright-core\cli.js'
+if ((Test-Path -LiteralPath $RtPkg -PathType Leaf) -and (Test-Path -LiteralPath $RtCli -PathType Leaf)) {
+  $AppUrl = 'file://' + ($App -replace '\\', '/') + '/browser-runtime.mjs'
+  $PinVersion = (& $Node -e "import('$AppUrl').then((m) => console.log(m.BROWSER_RUNTIME_PIN.playwright))" 2>$null)
+  $RtPkgUrl = $RtPkg -replace '\\', '/'
+  $RtVersion = (& $Node -p "require('$RtPkgUrl').version" 2>$null)
+  if ($PinVersion -and ($PinVersion.Trim() -eq $RtVersion.Trim())) {
+    if (Test-Path -LiteralPath $BrowserRt) { Remove-Item -LiteralPath $BrowserRt -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $BrowserBase | Out-Null
+    Copy-Item -LiteralPath $BrowserSrc -Destination "$BrowserRt.new" -Recurse -Force
+    if (Test-Path -LiteralPath $BrowserRt) { Remove-Item -LiteralPath $BrowserRt -Recurse -Force }
+    Rename-Item -LiteralPath "$BrowserRt.new" -NewName 'browser-runtime'
+    $env:PLAYWRIGHT_BROWSERS_PATH = $BrowserBrowsers
+    & $Node (Join-Path $BrowserRt 'playwright-core\cli.js') install chromium >$null 2>&1
+    if (($LASTEXITCODE -eq 0) -and (Get-ChildItem -LiteralPath $BrowserBrowsers -Directory -Filter 'chromium-*' -ErrorAction SilentlyContinue)) {
+      $BrowserReady = $true
+    } else {
+      Write-Host 'Warning: managed Chromium install failed (offline?); browser tools unavailable until installed.'
+    }
+  } else {
+    Write-Host "Warning: browser-runtime payload version ($RtVersion) does not match client pin ($PinVersion); skipping browser install."
+  }
+} else {
+  Write-Host 'Warning: no browser-runtime payload in bootstrap; browser tools unavailable until OTA delivers it.'
+}
+if ($BrowserReady) {
+  Write-Host "HHC canonical install complete: $Root (managed browser runtime ready)"
+} else {
+  Write-Host "HHC canonical install complete: $Root (managed browser runtime NOT ready; browser tools hidden until installed)"
+}

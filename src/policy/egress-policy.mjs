@@ -149,12 +149,38 @@ export function auditProjectionUrl(urlString) {
 }
 
 /**
+ * @param {string} hostname
+ * @param {ReadonlyArray<string>} list
+ */
+export function matchHostList(hostname, list) {
+  const host = String(hostname || '')
+    .toLowerCase()
+    .replace(/\.$/, '');
+  if (!host) return false;
+  for (const entry of list || []) {
+    const rule = String(entry || '')
+      .toLowerCase()
+      .replace(/\.$/, '');
+    if (!rule) continue;
+    if (host === rule || host.endsWith('.' + rule)) return true;
+  }
+  return false;
+}
+
+/**
  * @param {unknown} urlString
- * @param {{allowPrivateNetwork?: boolean, resolve?: ((hostname: string) => Promise<Array<string>>)|null, metadataIps?: ReadonlyArray<string>}} [options]
+ * @param {{allowPrivateNetwork?: boolean, allowLoopback?: boolean, allowedHosts?: ReadonlyArray<string>, blockedHosts?: ReadonlyArray<string>, resolve?: ((hostname: string) => Promise<Array<string>>)|null, metadataIps?: ReadonlyArray<string>}} [options]
  */
 export async function validateEgressUrl(
   urlString,
-  { allowPrivateNetwork = false, resolve = null, metadataIps = CLOUD_METADATA_IPS } = {}
+  {
+    allowPrivateNetwork = false,
+    allowLoopback = false,
+    allowedHosts = [],
+    blockedHosts = [],
+    resolve = null,
+    metadataIps = CLOUD_METADATA_IPS
+  } = {}
 ) {
   const raw = String(urlString || '').trim();
   if (!raw) return { ok: false, error: 'URL_REQUIRED' };
@@ -179,9 +205,26 @@ export async function validateEgressUrl(
   if (CLOUD_METADATA_HOSTS.includes(hostname.toLowerCase())) {
     return { ok: false, error: 'URL_METADATA_DENIED' };
   }
+  // Host policy lists: blocklist first, then allowlist. Evaluated on the
+  // hostname before DNS so policy intent survives rebind tricks; addresses
+  // are still validated below.
+  if (matchHostList(hostname, blockedHosts)) {
+    return { ok: false, error: 'URL_HOST_DENIED' };
+  }
+  if (
+    Array.isArray(allowedHosts) &&
+    allowedHosts.length > 0 &&
+    !matchHostList(hostname, allowedHosts)
+  ) {
+    return { ok: false, error: 'URL_HOST_DENIED' };
+  }
   const literal = net.isIPv6(hostname) ? hostname : normalizeHostnameIp(hostname);
   if (literal) {
-    return validateResolvedAddresses([literal], { allowPrivateNetwork, metadataIps });
+    return validateResolvedAddresses([literal], {
+      allowPrivateNetwork,
+      allowLoopback,
+      metadataIps
+    });
   }
   if (typeof resolve !== 'function') {
     return { ok: false, error: 'URL_DNS_VALIDATION_REQUIRED' };
@@ -195,16 +238,16 @@ export async function validateEgressUrl(
   if (!Array.isArray(addresses) || addresses.length === 0) {
     return { ok: false, error: 'URL_DNS_FAILED_CLOSED' };
   }
-  return validateResolvedAddresses(addresses, { allowPrivateNetwork, metadataIps });
+  return validateResolvedAddresses(addresses, { allowPrivateNetwork, allowLoopback, metadataIps });
 }
 
 /**
  * @param {Array<unknown>} addresses
- * @param {{allowPrivateNetwork?: boolean, metadataIps?: ReadonlyArray<string>}} [options]
+ * @param {{allowPrivateNetwork?: boolean, allowLoopback?: boolean, metadataIps?: ReadonlyArray<string>}} [options]
  */
 export function validateResolvedAddresses(
   addresses,
-  { allowPrivateNetwork = false, metadataIps = CLOUD_METADATA_IPS } = {}
+  { allowPrivateNetwork = false, allowLoopback = false, metadataIps = CLOUD_METADATA_IPS } = {}
 ) {
   const normalized = [];
   for (const candidate of addresses) {
@@ -219,7 +262,7 @@ export function validateResolvedAddresses(
   for (const ip of normalized) {
     const cls = classifyIp(ip);
     if (cls.kind === 'invalid') return { ok: false, error: 'URL_ADDRESS_INVALID', address: ip };
-    if (cls.deny)
+    if (cls.deny && !(allowLoopback === true && cls.reason === 'loopback'))
       return { ok: false, error: 'URL_ADDRESS_DENIED', reason: cls.reason, address: ip };
     if (cls.private && !allowPrivateNetwork) {
       return { ok: false, error: 'URL_PRIVATE_NETWORK_DENIED', reason: cls.reason, address: ip };
