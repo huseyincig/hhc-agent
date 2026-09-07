@@ -839,6 +839,9 @@ function normalizedJobId(job) {
 }
 
 /**
+
+
+/**
  * @param {string} jobId
  */
 async function postJobStart(jobId) {
@@ -858,6 +861,8 @@ async function postJobResult(jobId, result) {
     15000
   );
 }
+
+/**
 
 
 /**
@@ -1624,11 +1629,8 @@ export async function main() {
   const state = await readState();
   if (markInterruptedJobs(state)) await writeState(state);
   try {
-    const {
-      activateStagedBrowserRuntime,
-      activateBundledBrowserRuntime,
-      resolveBrowserRuntime
-    } = await import('../browser/browser-runtime.mjs');
+    const { activateStagedBrowserRuntime, activateBundledBrowserRuntime, resolveBrowserRuntime } =
+      await import('../browser/browser-runtime.mjs');
     const rtBase = resolveBrowserRuntime({ root: layout.root }).base;
     const bundled = await activateBundledBrowserRuntime({
       appDir: path.dirname(process.argv[1] || ''),

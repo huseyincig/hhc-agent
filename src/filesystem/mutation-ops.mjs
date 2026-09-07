@@ -664,6 +664,7 @@ export async function fileEditMutation(payload, { roots, fsApi = fs, pathApi = p
     return { path: normalized };
   });
 }
+
 /**
  * @param {object} [options]
  * @param {Array<string>} [options.writeRoots]
@@ -672,6 +673,7 @@ export async function fileEditMutation(payload, { roots, fsApi = fs, pathApi = p
  * @param {unknown} [options.pathApi]
  * @param {string} [options.platform]
  */
+
 export function makeMutationHandlers({
   writeRoots = [],
   policyGate,
