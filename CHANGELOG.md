@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `executeShellJob` extracted from `src/client/client.mjs` to
+  `src/shell/shell.mjs` with explicit `runtime` limits
+  (`{root, maxTimeoutSeconds, maxStdoutBytes, maxStderrBytes}`).
+  `shellChildDetached` now lives in `src/shell/shell.mjs`.
+  New: `tests/shell.test.mjs` (7 cases).
+
 ## 0.4.41 — 2026-09-07
 
 - Updater refuses non-newer versions (`UPDATE_VERSION_NOT_NEWER`).
