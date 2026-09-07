@@ -1,0 +1,14 @@
+[Unit]
+Description=HHC Privileged Helper Socket
+
+[Socket]
+ListenStream=/run/hhc/privileged-helper-v1.sock
+SocketUser=root
+SocketGroup=@HHC_SERVICE_GROUP@
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=true
+Accept=no
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=HHC Privileged Helper
+Requires=hhc-privileged-helper.socket
+After=hhc-privileged-helper.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=@NODE_BIN@ /opt/hhc/app/privileged-helper-linux-daemon.mjs
+Restart=on-failure
+RestartSec=5
+UMask=0077
+PrivateTmp=true
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX

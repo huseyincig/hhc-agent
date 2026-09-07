@@ -1,0 +1,175 @@
+$ErrorActionPreference = 'Stop'
+$Root = 'C:\HHC'
+$TaskName = 'HHC Client'
+$Src = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$Stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  throw 'Administrator privileges required'
+}
+$Node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+if (-not $Node) { throw 'Node.js 22+ required' }
+$Major = [int](& $Node -p "process.versions.node.split('.')[0]")
+if ($Major -lt 22) { throw 'Node.js 22+ required' }
+$Dirs = @('app','config','data','logs','releases','backups','tmp')
+$Supervisor = Join-Path $Root 'hhc-supervisor.ps1'
+foreach ($d in $Dirs) { New-Item -ItemType Directory -Force -Path (Join-Path $Root $d) | Out-Null }
+$Runtime = @('launcher.mjs','singleton.mjs','gui-launch.mjs','browser-adapter.mjs','egress-policy.mjs','client.mjs','ws-client.mjs','structured-ops.mjs','mutation-ops.mjs','host-policy.mjs','device-proof.mjs','lifecycle.mjs','updater.mjs','hhc-paths.mjs','privileged-helper-contract.mjs','privileged-helper-core.mjs','privileged-helper-ipc.mjs','linux-peer-credentials.mjs','privileged-helper-linux-daemon.mjs','privileged-helper-linux-operations.mjs','privileged-helper-bootstrap.mjs','privileged-helper-client.mjs','privileged-helper-linux-readiness.mjs','package.json')
+$New = Join-Path $Root "tmp\app-new-$Stamp"
+New-Item -ItemType Directory -Force -Path $New | Out-Null
+foreach ($f in $Runtime) {
+  $from = Join-Path $Src $f
+  if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { throw "Missing runtime file: $f" }
+  Copy-Item -LiteralPath $from -Destination (Join-Path $New $f) -Force
+}
+& $Node --check (Join-Path $New 'launcher.mjs')
+& $Node --check (Join-Path $New 'client.mjs')
+& $Node --check (Join-Path $New 'updater.mjs')
+$App = Join-Path $Root 'app'
+# Stop only the HHC scheduled task/process before replacing the live app tree.
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$Deadline = (Get-Date).AddSeconds(10)
+do {
+  $HhcProcesses = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    $_.CommandLine -like '*C:\HHC\app\launcher.mjs*' -or
+    $_.CommandLine -like '*C:\HHC\tmp\watchdog-*.mjs*'
+  })
+  if ($HhcProcesses.Count -eq 0) { break }
+  foreach ($proc in $HhcProcesses) { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue }
+  Start-Sleep -Milliseconds 250
+} while ((Get-Date) -lt $Deadline)
+$HhcProcesses = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object {
+  $_.CommandLine -like '*C:\HHC\app\launcher.mjs*' -or
+  $_.CommandLine -like '*C:\HHC\tmp\watchdog-*.mjs*'
+})
+if ($HhcProcesses.Count -gt 0) { throw 'Unable to stop HHC runtime/update helper processes' }
+Remove-Item -LiteralPath (Join-Path $Root 'data\client.lock') -Force -ErrorAction SilentlyContinue
+$MigrationBackup = Join-Path $Root "backups\migration-app-$Stamp"
+New-Item -ItemType Directory -Force -Path $MigrationBackup | Out-Null
+try {
+  foreach ($item in @(Get-ChildItem -LiteralPath $App -Force -ErrorAction SilentlyContinue)) {
+    Move-Item -LiteralPath $item.FullName -Destination $MigrationBackup -Force
+  }
+  foreach ($item in @(Get-ChildItem -LiteralPath $New -Force)) {
+    Move-Item -LiteralPath $item.FullName -Destination $App -Force
+  }
+} catch {
+  foreach ($item in @(Get-ChildItem -LiteralPath $App -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+  foreach ($item in @(Get-ChildItem -LiteralPath $MigrationBackup -Force -ErrorAction SilentlyContinue)) { Move-Item -LiteralPath $item.FullName -Destination $App -Force -ErrorAction SilentlyContinue }
+  throw
+}
+Remove-Item -LiteralPath $New -Recurse -Force -ErrorAction SilentlyContinue
+$EnvDst = Join-Path $Root 'config\hhc-client.env'
+$Candidates = @(
+  $EnvDst,
+  (Join-Path $Src 'client.env'),
+  'C:\hhc\client.env',
+  'C:\Program Files\HHC\client.env',
+  'C:\ProgramData\HHC\client.env'
+)
+$EnvSrc = $Candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if ($EnvSrc -and ($EnvSrc -ne $EnvDst)) {
+  $Drop = '^(HHC_ROOT|HHC_AUDIT_FILE|HHC_SERVER_LOG_FILE|HHC_TUNNEL_LOG_FILE|HHC_STATE_FILE|HHC_CLIENT_LOG|HHC_LOCAL_AUDIT_FILE)='
+  Get-Content -LiteralPath $EnvSrc | Where-Object { $_ -notmatch $Drop } | Set-Content -LiteralPath $EnvDst -Encoding utf8
+} elseif (-not (Test-Path -LiteralPath $EnvDst)) {
+  New-Item -ItemType File -Path $EnvDst | Out-Null
+}
+function Copy-LegacyOne([string]$Destination, [string[]]$Sources) {
+  if (Test-Path -LiteralPath $Destination) { return }
+  foreach ($source in $Sources) {
+    if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination $Destination; return }
+  }
+}
+Copy-LegacyOne (Join-Path $Root 'data\client-state.json') @((Join-Path $Src 'state.json'),'C:\hhc\state.json','C:\Program Files\HHC\state.json','C:\ProgramData\HHC\state.json')
+Copy-LegacyOne (Join-Path $Root 'logs\client.log') @((Join-Path $Src 'client.log'),'C:\hhc\client.log','C:\Program Files\HHC\client.log','C:\ProgramData\HHC\client.log')
+Copy-LegacyOne (Join-Path $Root 'logs\audit.jsonl') @((Join-Path $Src 'audit.jsonl'),'C:\hhc\audit.jsonl','C:\Program Files\HHC\audit.jsonl','C:\ProgramData\HHC\audit.jsonl')
+& icacls.exe $Root /inheritance:r | Out-Null
+& icacls.exe $Root /grant:r 'SYSTEM:(OI)(CI)(F)' 'Administrators:(OI)(CI)(F)' 'LOCAL SERVICE:(OI)(CI)(M)' | Out-Null
+$BrokerSrc = Join-Path $Src 'install\hhc-gui-broker.ps1'
+$BrokerDst = Join-Path $Root 'hhc-gui-broker.ps1'
+if (-not (Test-Path -LiteralPath $BrokerSrc -PathType Leaf)) { throw 'Missing Windows GUI broker' }
+Copy-Item -LiteralPath $BrokerSrc -Destination $BrokerDst -Force
+$GuiBrokerDir = Join-Path $Root 'data\gui-brokers'
+$GuiQueueDir = Join-Path $Root 'data\gui-queue'
+$GuiResultDir = Join-Path $Root 'data\gui-results'
+foreach ($d in @($GuiBrokerDir,$GuiQueueDir,$GuiResultDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+& icacls.exe $Root /grant '*S-1-5-32-545:(RX)' | Out-Null
+& icacls.exe (Join-Path $Root 'data') /grant '*S-1-5-32-545:(RX)' | Out-Null
+& icacls.exe $BrokerDst /grant '*S-1-5-32-545:(R)' | Out-Null
+foreach ($d in @($GuiBrokerDir,$GuiQueueDir,$GuiResultDir)) { & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)(M)' | Out-Null }
+$CommonStartup = [Environment]::GetFolderPath('CommonStartup')
+$StartupCmd = Join-Path $CommonStartup 'HHC Interactive Broker.cmd'
+('@echo off' + "`r`n" + 'start "" /min powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\HHC\hhc-gui-broker.ps1"' + "`r`n") | Set-Content -LiteralPath $StartupCmd -Encoding ascii
+$InteractiveUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$InstallerSessionId = (Get-Process -Id $PID).SessionId
+if (-not $InteractiveUser) { throw 'Unable to resolve interactive installer user' }
+if ($InstallerSessionId -eq 0) { throw 'Installer must run from an interactive Windows user session' }
+if ($InteractiveUser) {
+  $BrokerTask = 'HHC Interactive Broker'
+  $Ba = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\HHC\hhc-gui-broker.ps1"' -WorkingDirectory $Root
+  $Bp = New-ScheduledTaskPrincipal -UserId $InteractiveUser -LogonType Interactive -RunLevel Limited
+  $Bt = New-ScheduledTaskTrigger -AtLogOn -User $InteractiveUser
+  $Bs = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
+  Register-ScheduledTask -TaskName $BrokerTask -Action $Ba -Trigger $Bt -Principal $Bp -Settings $Bs -Force | Out-Null
+  Start-ScheduledTask -TaskName $BrokerTask
+  $BrokerDeadline = (Get-Date).AddSeconds(10)
+  do {
+    $BrokerReady = @(Get-ChildItem -LiteralPath $GuiBrokerDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -gt (Get-Date).ToUniversalTime().AddSeconds(-10) }).Count -gt 0
+    if ($BrokerReady) { break }
+    Start-Sleep -Milliseconds 250
+  } while ((Get-Date) -lt $BrokerDeadline)
+  if (-not $BrokerReady) { throw 'HHC interactive broker failed to start' }
+}
+@"
+`$ErrorActionPreference = 'Continue'
+`$Node = '$($Node.Replace("'", "''"))'
+`$Root = 'C:\HHC'
+`$Lock = Join-Path `$Root 'data\update-switch.lock'
+`$Retired = Join-Path `$Root 'data\retired.json'
+while (`$true) {
+  if (Test-Path -LiteralPath `$Retired) { exit 0 }
+  while (Test-Path -LiteralPath `$Lock) { Start-Sleep -Milliseconds 500 }
+  if (Test-Path -LiteralPath `$Retired) { exit 0 }
+  `$Launcher = Join-Path `$Root 'app\launcher.mjs'
+  if (-not (Test-Path -LiteralPath `$Launcher -PathType Leaf)) { Start-Sleep -Seconds 2; continue }
+  `$p = Start-Process -FilePath `$Node -ArgumentList `$Launcher -WorkingDirectory (Join-Path `$Root 'app') -PassThru
+  `$p.WaitForExit()
+  if (Test-Path -LiteralPath `$Retired) { exit 0 }
+  Start-Sleep -Seconds 1
+}
+"@ | Set-Content -LiteralPath $Supervisor -Encoding utf8
+$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + $Supervisor + '"') -WorkingDirectory $Root
+$Trigger = New-ScheduledTaskTrigger -AtStartup
+$Principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount -RunLevel Limited
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings | Out-Null
+Remove-Item -LiteralPath (Join-Path $Root 'data\retired.json') -Force -ErrorAction SilentlyContinue
+$UninstallSrc = Join-Path $Src 'install\uninstall-windows.ps1'
+$UninstallDst = Join-Path $Root 'uninstall.ps1'
+if (-not (Test-Path -LiteralPath $UninstallSrc -PathType Leaf)) { throw 'Missing Windows uninstall script' }
+Copy-Item -LiteralPath $UninstallSrc -Destination $UninstallDst -Force
+& icacls.exe $UninstallDst /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
+Start-ScheduledTask -TaskName $TaskName
+$ExpectedVersion = (Get-Content -LiteralPath (Join-Path $App 'package.json') -Raw | ConvertFrom-Json).version
+$ClientLog = Join-Path $Root 'logs\client.log'
+$StartupDeadline = (Get-Date).AddSeconds(15)
+$RuntimeReady = $false
+while ((Get-Date) -lt $StartupDeadline) {
+  $Runtime = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*C:\HHC\app\launcher.mjs*' })
+  if ($Runtime.Count -gt 0 -and (Test-Path -LiteralPath $ClientLog)) {
+    $Recent = @(Get-Content -LiteralPath $ClientLog -Tail 30 -ErrorAction SilentlyContinue)
+    if ($Recent | Where-Object { $_ -like ('*"message":"hhc-client starting"*"version":"' + $ExpectedVersion + '"*') }) { $RuntimeReady = $true; break }
+  }
+  Start-Sleep -Milliseconds 500
+}
+$Task = Get-ScheduledTask -TaskName $TaskName
+$Info = Get-ScheduledTaskInfo -TaskName $TaskName
+if ($Task.State -eq 'Disabled') { throw 'HHC task is disabled' }
+if ($Info.LastTaskResult -notin @(0,267009)) { throw "HHC task failed: $($Info.LastTaskResult)" }
+if (-not $RuntimeReady) {
+  Write-Host '--- HHC startup diagnostics ---'
+  Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*C:\HHC*' } | Select-Object ProcessId,ParentProcessId,CommandLine | Format-List | Out-Host
+  if (Test-Path -LiteralPath $ClientLog) { Get-Content -LiteralPath $ClientLog -Tail 30 | Out-Host }
+  throw "HHC runtime failed to start release $ExpectedVersion"
+}
+Write-Host "HHC canonical install complete: $Root"
