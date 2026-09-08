@@ -1,6 +1,6 @@
 {
   "name": "@hhc/agent",
-  "version": "0.4.46",
+  "version": "0.4.47",
   "private": true,
   "type": "module",
   "engines": {
