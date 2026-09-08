@@ -278,9 +278,7 @@ export async function fileSearchJob(job, { readRoots = [defaultHhcRoot()] } = {}
   // stays bounded without session machinery; exhaustion reports honestly.
   const startedAt = Date.now();
   const rawBudget = Number(p.timeout_ms ?? 25000);
-  const budgetMs = Number.isFinite(rawBudget)
-    ? Math.max(1000, Math.min(60000, rawBudget))
-    : 25000;
+  const budgetMs = Number.isFinite(rawBudget) ? Math.max(1000, Math.min(60000, rawBudget)) : 25000;
   const timedOut = () => Date.now() - startedAt > budgetMs;
   try {
     const roots = [...readRoots, ...policyExtraRoots(job).read];
