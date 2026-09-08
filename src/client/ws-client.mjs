@@ -108,6 +108,20 @@ export class ClientWebSocket extends EventEmitter {
     this.socket.end();
     this.closed = true;
   }
+  /**
+   * Immediate teardown for dead-peer detection (pong timeout). Unlike
+   * close(), it never waits for a peer close frame that will never arrive
+   * on a half-open socket. Emits 'close' exactly once.
+   * @param {string} [reason]
+   */
+  destroy(reason = '') {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      this.socket.destroy();
+    } catch {}
+    this.emit('close', reason || 'destroyed');
+  }
   #parse() {
     while (this.buf.length >= 2) {
       const b0 = this.buf[0],

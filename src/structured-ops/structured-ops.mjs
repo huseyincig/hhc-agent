@@ -274,6 +274,14 @@ export async function fileSearchJob(job, { readRoots = [defaultHhcRoot()] } = {}
   );
   const query = String(p.query || '').slice(0, 200);
   if (!query) return fail('QUERY_REQUIRED');
+  // Stateless walk with a hard time budget (SYN-FS-001): worst-case latency
+  // stays bounded without session machinery; exhaustion reports honestly.
+  const startedAt = Date.now();
+  const rawBudget = Number(p.timeout_ms ?? 25000);
+  const budgetMs = Number.isFinite(rawBudget)
+    ? Math.max(1000, Math.min(60000, rawBudget))
+    : 25000;
+  const timedOut = () => Date.now() - startedAt > budgetMs;
   try {
     const roots = [...readRoots, ...policyExtraRoots(job).read];
     const root = await realAllowed(String(p.path || ''), roots),
@@ -281,7 +289,12 @@ export async function fileSearchJob(job, { readRoots = [defaultHhcRoot()] } = {}
       stack = [root],
       results = [];
     let files = 0;
+    let timeExceeded = false;
     while (stack.length && files < 2000 && results.length < maxResults) {
+      if (timedOut()) {
+        timeExceeded = true;
+        break;
+      }
       const dir = /** @type {string} */ (stack.pop());
       let rows = [];
       try {
@@ -330,7 +343,8 @@ export async function fileSearchJob(job, { readRoots = [defaultHhcRoot()] } = {}
       query,
       results,
       files_searched: files,
-      truncated: stack.length > 0 || files >= 2000 || results.length >= maxResults
+      truncated: stack.length > 0 || files >= 2000 || results.length >= maxResults,
+      timed_out: timeExceeded
     });
   } catch (e) {
     const errorRecord = /** @type {{message?: unknown}} */ (e);

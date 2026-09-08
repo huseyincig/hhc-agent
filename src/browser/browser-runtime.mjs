@@ -290,10 +290,16 @@ export function applyBrowsersPathEnv(browsersDir) {
  */
 export async function activateBundledBrowserRuntime({ appDir, base }) {
   try {
-    const bundledPkg = readJsonFile(path.join(appDir, 'browser-runtime', 'playwright-core'), 'package.json');
+    const bundledPkg = readJsonFile(
+      path.join(appDir, 'browser-runtime', 'playwright-core'),
+      'package.json'
+    );
     if (!bundledPkg || String(bundledPkg.version || '') !== BROWSER_RUNTIME_PIN.playwright)
       return { promoted: false, reason: 'pin-mismatch' };
-    const livePkg = readJsonFile(path.join(base, 'browser-runtime', 'playwright-core'), 'package.json');
+    const livePkg = readJsonFile(
+      path.join(base, 'browser-runtime', 'playwright-core'),
+      'package.json'
+    );
     if (livePkg && String(livePkg.version || '') === BROWSER_RUNTIME_PIN.playwright)
       return { promoted: false, reason: 'current' };
     const staged = path.join(base, 'browser-runtime.staging');
@@ -337,7 +343,8 @@ export async function ensureManagedBrowsers(base) {
       withDeps: false,
       promote: true
     });
-    if (!staged.ok) return { installed: false, error: staged.error || 'BROWSER_INSTALLATION_MISSING' };
+    if (!staged.ok)
+      return { installed: false, error: staged.error || 'BROWSER_INSTALLATION_MISSING' };
     return { installed: true, revision: staged.revision || revision };
   } catch {
     return { installed: false, error: 'BROWSER_INTERNAL_ERROR' };
@@ -348,8 +355,13 @@ export async function ensureManagedBrowsers(base) {
  * Boot-time promotion of a staged browser runtime (OTA path). The staged
  * payload activates only when its Playwright version equals the running
  * code pin: old code ignores newer staging, new code ignores stale staging.
- * Validation (launch a blank page) runs BEFORE any live path is touched;
- * the previous runtime is kept as .prev for one generation.
+ *
+ * The runtime JS and the browser binaries promote INDEPENDENTLY: a pin
+ * match always promotes the JS (validating the binary would deadlock fresh
+ * hosts, where the binary can only arrive after the JS is live). Missing
+ * binaries are reported, stay hidden behind the health gate, and converge
+ * via ensureManagedBrowsers on this and every later boot. The previous
+ * runtime is kept as .prev for one generation.
  * @param {string} base
  */
 export async function activateStagedBrowserRuntime(base) {
@@ -364,31 +376,9 @@ export async function activateStagedBrowserRuntime(base) {
   }
   const browsersDir = path.join(base, 'playwright-browsers');
   const stagingDir = path.join(base, 'playwright-browsers.staging');
-  // Browsers may already be live (installer path) or staged (OTA path).
-  const liveRevs = installedChromiumRevisions(browsersDir);
   const revision = expectedChromiumRevision(stagedCore);
-  if (!liveRevs.includes(revision)) {
-    if (!installedChromiumRevisions(stagingDir).includes(revision)) {
-      rmrf(staged);
-      return { promoted: false, reason: 'browser-revision-missing' };
-    }
-    const probe = await validateBrowserLaunch({
-      coreDir: stagedCore,
-      browsersDir: stagingDir,
-      headless: true,
-      timeoutMs: 60000
-    });
-    if (!probe.ok) {
-      rmrf(staged);
-      return { promoted: false, reason: probe.error || 'BROWSER_LAUNCH_FAILED' };
-    }
-    const promoted = promoteStagedBrowserDirs(browsersDir, stagingDir);
-    if (!promoted.ok) {
-      rmrf(staged);
-      return { promoted: false, reason: 'BROWSER_INTERNAL_ERROR' };
-    }
-    rmrf(stagingDir);
-  }
+  // Promote the JS first: it is what the health gate and all later steps
+  // execute. Binaries follow opportunistically below.
   try {
     rmrf(prev);
     if (fs.existsSync(live)) fs.renameSync(live, prev);
@@ -396,7 +386,31 @@ export async function activateStagedBrowserRuntime(base) {
   } catch {
     return { promoted: false, reason: 'BROWSER_INTERNAL_ERROR' };
   }
-  return { promoted: true, playwright: BROWSER_RUNTIME_PIN.playwright, revision };
+  // Binaries: live already has them, or staging validated them, or they
+  // converge later via ensureManagedBrowsers (never a promotion blocker).
+  let browsers = 'absent';
+  try {
+    if (installedChromiumRevisions(browsersDir).includes(revision)) {
+      browsers = 'live';
+    } else if (installedChromiumRevisions(stagingDir).includes(revision)) {
+      const probe = await validateBrowserLaunch({
+        coreDir: path.join(live, 'playwright-core'),
+        browsersDir: stagingDir,
+        headless: true,
+        timeoutMs: 60000
+      });
+      if (probe.ok) {
+        const promoted = promoteStagedBrowserDirs(browsersDir, stagingDir);
+        browsers = promoted.ok ? 'promoted' : 'validation-failed';
+      } else {
+        browsers = probe.error || 'BROWSER_LAUNCH_FAILED';
+      }
+      rmrf(stagingDir);
+    }
+  } catch {
+    browsers = 'BROWSER_INTERNAL_ERROR';
+  }
+  return { promoted: true, playwright: BROWSER_RUNTIME_PIN.playwright, revision, browsers };
 }
 
 /**

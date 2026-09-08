@@ -52,7 +52,7 @@ import { makeServiceHandlers } from '../services/service-ops.mjs';
 import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.44';
+const VERSION = '0.4.46';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),
@@ -96,6 +96,69 @@ const LOG_SOURCES = /** @type {Record<string, string>} */ (
   })
 );
 const SESSION_BACKOFF = [0, 1, 5, 15, 30, 60];
+// Pong window after each ping we send: a healthy hub answers in
+// milliseconds, so 10s is generous. Any inbound frame also counts as
+// liveness (superset of pong-only tracking).
+export const PONG_TIMEOUT_MS = 10000;
+
+/**
+ * Liveness watchdog for one session (SYN-TRANS-001). Call `poke()` on every
+ * inbound frame and `sentPing()` after each ping we emit. When `sentPing()`
+ * is not followed by any inbound traffic within the window, `onTimeout`
+ * fires once so the caller can destroy the (likely half-open) socket and
+ * reconnect. All timing injectable for tests.
+ * @param {{windowMs?: number, now?: () => number, setTimer?: typeof setTimeout, clearTimer?: typeof clearTimeout, onTimeout?: () => void}} [options]
+ */
+export function attachPongWatchdog({
+  windowMs = PONG_TIMEOUT_MS,
+  now = () => Date.now(),
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  onTimeout = () => {}
+} = {}) {
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let timer = null;
+  let fired = false;
+  let lastActivityMs = now();
+  const cancel = () => {
+    if (timer) {
+      clearTimer(timer);
+      timer = null;
+    }
+  };
+  return {
+    poke() {
+      if (fired) return;
+      lastActivityMs = now();
+      cancel();
+    },
+    sentPing() {
+      if (fired) return;
+      lastActivityMs = now();
+      cancel();
+      timer = setTimer(() => {
+        timer = null;
+        if (fired) return;
+        fired = true;
+        onTimeout();
+      }, windowMs);
+    },
+    cancel,
+    get armed() {
+      return timer !== null;
+    },
+    get lastActivityMs() {
+      return lastActivityMs;
+    }
+  };
+}
+
+/** @param {number} baseSeconds */
+export function reconnectDelayMs(baseSeconds) {
+  return (
+    Math.max(0, Math.floor(Number(baseSeconds) || 0)) * 1000 + Math.floor(Math.random() * 1000)
+  );
+}
 /**
  * @typedef {Object} AgentPolicy
  * @property {string} contract_version
@@ -123,6 +186,7 @@ const SESSION_BACKOFF = [0, 1, 5, 15, 30, 60];
  * Wire callbacks receive untyped JSON (same contract as Express req.body).
  * @property {(msg: unknown) => unknown} sendJson
  * @property {(code?: number, reason?: string) => unknown} close
+ * @property {(reason?: string) => unknown} [destroy]
  * @property {(event: string, listener: (msg: any) => unknown) => unknown} on
  * @property {(event: string, listener: (msg: any) => unknown) => unknown} once
  * @typedef {Object} SessionMessage
@@ -984,6 +1048,14 @@ export const browserHealthCache = {
   revision: null
 };
 
+/** Re-announces capabilities on the live session, if any (cheap, idempotent). */
+export function announceCapabilities() {
+  try {
+    const peer = /** @type {{sendJson?: unknown}} */ (liveSession);
+    if (peer && typeof peer.sendJson === 'function')
+      /** @type {(m: unknown) => void} */ (peer.sendJson).call(peer, sessionHello());
+  } catch {}
+}
 /** Runs the lightweight startup browser health gate (no browser launch). */
 export async function refreshBrowserHealth() {
   try {
@@ -1453,9 +1525,17 @@ async function runSessionOnce(state) {
     }),
     timer = setTimeout(() => rejectWelcome(new Error('WELCOME_TIMEOUT')), 10000);
   ws.on('json', (m) => {
+    watchdog.poke();
     if (m.type === 'welcome') {
       welcomed = true;
       clearTimeout(timer);
+      try {
+        // Re-hellos (capability re-announce) also refresh a stale policy
+        // when the hub sends a newer revision.
+        const p = m?.policy ? applyCurrentPolicy(m.policy) : null;
+        if (p && (!currentPolicy || Number(p.revision) >= Number(currentPolicy.revision || 0)))
+          currentPolicy = p;
+      } catch {}
       resolveWelcome(m);
       return;
     }
@@ -1475,6 +1555,12 @@ async function runSessionOnce(state) {
       rejectWelcome(new Error(m.code || m.message || 'SESSION_FATAL'));
   });
   ws.on('protocolError', (e) => rejectWelcome(e));
+  // Hello reflects current disk state on every (re)connect: a runtime that
+  // arrived after boot (OTA, background convergence) advertises without
+  // waiting for a process restart. Lightweight (no browser launch).
+  try {
+    await refreshBrowserHealth();
+  } catch {}
   ws.sendJson(sessionHello());
   const w = await welcome;
   currentPolicy = w?.policy ? applyCurrentPolicy(w.policy) : null;
@@ -1488,10 +1574,24 @@ async function runSessionOnce(state) {
   });
   await markUpdateHealthy(layout, VERSION);
   await flushSessionPending(state, ws);
+  // Dead-peer detection (SYN-TRANS-001): every ping we send arms a 10s
+  // window; ANY inbound frame disarms it. A half-open socket that swallows
+  // pings trips the window → destroy → existing close/error path →
+  // backoff reconnect. No behavior change on healthy links.
+  const watchdog = attachPongWatchdog({
+    onTimeout: () => {
+      log('error', 'session_pong_timeout', { after_ms: PONG_TIMEOUT_MS }).catch(() => {});
+      try {
+        if (typeof ws.destroy === 'function') ws.destroy('pong timeout');
+        else ws.close(4001, 'pong timeout');
+      } catch {}
+    }
+  });
   const hb = Math.max(5, Number(w.heartbeat_interval_seconds || 30)) * 1000,
     h = setInterval(() => {
       try {
         ws.sendJson({ type: 'ping', timestamp: new Date().toISOString() });
+        watchdog.sentPing();
       } catch {}
     }, hb);
   try {
@@ -1504,6 +1604,7 @@ async function runSessionOnce(state) {
     throw error;
   } finally {
     clearInterval(h);
+    watchdog.cancel();
     if (liveSession === ws) liveSession = null;
   }
   if (welcomed) {
@@ -1529,7 +1630,7 @@ async function sessionLoop(state) {
   let attempt = 0;
   while (!retired) {
     const wait = SESSION_BACKOFF[Math.min(attempt, SESSION_BACKOFF.length - 1)];
-    if (wait) await sleep(wait * 1000);
+    if (wait) await sleep(reconnectDelayMs(wait));
     if (retired) return;
     try {
       await runSessionOnce(state);
@@ -1640,9 +1741,19 @@ export async function main() {
     await log('info', 'browser_runtime_promotion', { bundled, staged: promoted });
     // Converge the Chromium binary in the background (see
     // ensureManagedBrowsers): boot and hello never wait for the download.
+    // When convergence newly completes, re-announce so the hub learns the
+    // browser tools without waiting for a reconnect.
     import('../browser/browser-runtime.mjs')
       .then((m) => m.ensureManagedBrowsers(rtBase))
-      .then((r) => log('info', 'browser_binary_convergence', { ...r }))
+      .then(async (r) => {
+        await log('info', 'browser_binary_convergence', { ...r });
+        if (r.installed && !browserHealthCache.available) {
+          try {
+            await refreshBrowserHealth();
+          } catch {}
+          if (browserHealthCache.available) announceCapabilities();
+        }
+      })
       .catch(() => {});
   } catch {}
   try {
