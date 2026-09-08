@@ -149,6 +149,7 @@ export function requiredCapabilitiesForOperation(tool, payload = {}, origin = 'm
     file_search: ['file_read'],
     service_status: ['service_status'],
     gui_launch: ['gui_launch'],
+    gui_close: ['gui_launch'],
     browser_navigate: ['gui_launch'],
     browser_interact: ['gui_launch'],
     browser_snapshot: ['gui_launch'],

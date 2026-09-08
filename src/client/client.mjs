@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { connectWebSocket } from './ws-client.mjs';
 import { makeStructuredHandlers, extendStructuredHandlers } from '../structured-ops/structured-ops.mjs';
 import { makeMutationHandlers } from '../filesystem/mutation-ops.mjs';
-import { makeGuiLaunchHandler } from '../../gui-broker/gui-launch.mjs';
+import { makeGuiCloseHandler, makeGuiLaunchHandler } from '../../gui-broker/gui-launch.mjs';
 import {
   makeUpdateHandler,
   activatePreparedUpdate,
@@ -53,7 +53,7 @@ import { makeServiceHandlers } from '../services/service-ops.mjs';
 import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.60';
+const VERSION = '0.4.61';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),
@@ -1159,7 +1159,12 @@ export function getHandlers() {
             })
           }
         : {}),
-      ...(process.platform === 'win32' ? { gui_launch: makeGuiLaunchHandler({ layout }) } : {}),
+      ...(process.platform === 'win32'
+        ? {
+            gui_launch: makeGuiLaunchHandler({ layout }),
+            gui_close: makeGuiCloseHandler({ layout })
+          }
+        : {}),
       client_update: makeUpdateHandler({
         serverUrl: cfg.serverUrl,
         clientId: cfg.clientId,

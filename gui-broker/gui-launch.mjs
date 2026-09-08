@@ -102,6 +102,42 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const parseJsonText = (text) => JSON.parse(String(text).replace(/^\uFEFF/, ''));
 
 /**
+ * PIDs this agent incarnation launched via gui_launch (pid -> unix ms).
+ * gui_close only accepts these: closing foreign PIDs would exceed the
+ * granted privilege (launch allowlisted apps, not manage the session).
+ */
+const launchedGuiPids = /** @type {Map<number, number>} */ (new Map());
+const LAUNCHED_PID_TTL_MS = 24 * 60 * 60 * 1000;
+const LAUNCHED_PID_MAX = 1000;
+/** @param {unknown} pid */
+function trackLaunchedGuiPid(pid) {
+  const id = Number(pid);
+  if (!Number.isInteger(id) || id <= 0) return;
+  launchedGuiPids.set(id, Date.now());
+  if (launchedGuiPids.size > LAUNCHED_PID_MAX) {
+    const oldest = [...launchedGuiPids.entries()].sort(
+      (/** @type {[number, number]} */ a, /** @type {[number, number]} */ b) => a[1] - b[1]
+    )[0];
+    if (oldest) launchedGuiPids.delete(oldest[0]);
+  }
+}
+/** @param {unknown} pid */
+function untrackLaunchedGuiPid(pid) {
+  launchedGuiPids.delete(Number(pid));
+}
+/** @param {unknown} pid */
+function isLaunchedGuiPid(pid) {
+  const id = Number(pid);
+  if (!Number.isInteger(id) || id <= 0) return false;
+  const at = launchedGuiPids.get(id);
+  if (at === undefined) return false;
+  if (Date.now() - at > LAUNCHED_PID_TTL_MS) {
+    launchedGuiPids.delete(id);
+    return false;
+  }
+  return true;
+}
+/**
  * @param {string} app
  * @param {unknown} target
  */
@@ -181,14 +217,76 @@ export function makeGuiLaunchHandler({ layout = hhcLayout(), platform = process.
           const r = parseJsonText(await fs.readFile(resultFile, 'utf8'));
           await fs.rm(resultFile, { force: true });
           if (!r.ok) throw new Error(r.error || 'GUI_LAUNCH_FAILED');
+          const finalPid = await resolveGuiPid(app, r.pid, platform);
+          trackLaunchedGuiPid(finalPid);
           return {
             ...ok({
               application: app,
               target,
               user: r.username,
               session_id: r.session_id,
-              pid: await resolveGuiPid(app, r.pid, platform)
+              pid: finalPid
             }),
+            duration_ms: Date.now() - started
+          };
+        } catch (e) {
+          const errorCode = e && typeof e === 'object' && 'code' in e ? e.code : undefined;
+          if (errorCode !== 'ENOENT') throw e;
+        }
+        await sleep(150);
+      }
+      throw new Error('GUI_BROKER_TIMEOUT');
+    } catch (e) {
+      const errorRecord = /** @type {{message?: unknown}} */ (e);
+      return { ...fail(errorRecord?.message), duration_ms: Date.now() - started };
+    }
+  };
+}
+
+/**
+ * Close a GUI application previously launched via gui_launch (win32 only —
+ * the broker lives in the interactive user session). Only PIDs recorded by
+ * trackLaunchedGuiPid are accepted; anything else fails closed with
+ * GUI_PID_NOT_MANAGED instead of touching foreign processes.
+ * @param {object} [options]
+ * @param {ReturnType<typeof import('../src/client/hhc-paths.mjs').hhcLayout>} [options.layout]
+ * @param {string} [options.platform]
+ */
+export function makeGuiCloseHandler({ layout = hhcLayout(), platform = process.platform } = {}) {
+  return async (/** @type {unknown} */ job) => {
+    const started = Date.now();
+    try {
+      if (platform !== 'win32') throw new Error('GUI_CLOSE_WINDOWS_ONLY');
+      const jobRecord = /** @type {{request_payload?: unknown, payload?: unknown}} */ (job || {});
+      const p = /** @type {Record<string, unknown>} */ (
+        jobRecord.request_payload || jobRecord.payload || {}
+      );
+      const pid = Number(p.pid);
+      if (!Number.isInteger(pid) || pid <= 0) throw new Error('GUI_PID_REQUIRED');
+      if (!isLaunchedGuiPid(pid)) throw new Error('GUI_PID_NOT_MANAGED');
+      const brokers = await liveBrokers(layout, '');
+      if (!brokers.length) throw new Error('GUI_BROKER_NOT_AVAILABLE');
+      const broker = brokers[0],
+        id = crypto.randomUUID(),
+        queue = path.join(layout.data, 'gui-queue', String(broker.session_id)),
+        results = path.join(layout.data, 'gui-results');
+      await fs.mkdir(queue, { recursive: true });
+      await fs.mkdir(results, { recursive: true });
+      const req = { id, action: 'close', pid, created_at: new Date().toISOString() };
+      const tmp = path.join(queue, `.${id}.tmp`),
+        file = path.join(queue, `${id}.json`);
+      await fs.writeFile(tmp, JSON.stringify(req) + '\n', { mode: 0o640 });
+      await fs.rename(tmp, file);
+      const resultFile = path.join(results, `${id}.json`),
+        deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        try {
+          const r = parseJsonText(await fs.readFile(resultFile, 'utf8'));
+          await fs.rm(resultFile, { force: true });
+          if (!r.ok) throw new Error(r.error || 'GUI_CLOSE_FAILED');
+          untrackLaunchedGuiPid(pid);
+          return {
+            ...ok({ pid, closed: r.closed === true }),
             duration_ms: Date.now() - started
           };
         } catch (e) {
