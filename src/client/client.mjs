@@ -22,7 +22,8 @@ import {
   authorizeBoundJob,
   policyBindingFromJob,
   policyBindingRecord,
-  validatePolicy
+  validatePolicy,
+  verifyPolicySignature
 } from '../policy/host-policy.mjs';
 import { createDeviceProof, deviceAuthHeaders, loadDeviceKey } from './device-proof.mjs';
 import {
@@ -52,7 +53,7 @@ import { makeServiceHandlers } from '../services/service-ops.mjs';
 import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.50';
+const VERSION = '0.4.51';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),
@@ -619,14 +620,27 @@ async function requestJson(method, urlPath, body, timeoutMs = 7000) {
 const postJson = (urlPath, body, timeoutMs) => requestJson('POST', urlPath, body, timeoutMs);
 
 /**
- * @param {unknown} policy @returns {AgentPolicy}
+ * @param {unknown} policy @param {unknown} [sig] policy_sig sibling envelope
+ * @returns {AgentPolicy}
  */
-function applyCurrentPolicy(policy) {
-  if (!transportProtected() && process.env.HHC_ALLOW_INSECURE_POLICY !== '1') {
+function applyCurrentPolicy(policy, sig = null) {
+  if (!transportProtected()) {
     const error = /** @type {Error & {code?: string}} */ (
       new Error('HOST_POLICY_TRANSPORT_UNPROTECTED')
     );
     error.code = 'HOST_POLICY_TRANSPORT_UNPROTECTED';
+    throw error;
+  }
+  // SYN-POL-001: authenticity is cryptographic, not transport-implied. The
+  // HHC_ALLOW_INSECURE_POLICY escape is gone; a valid signature is required
+  // on every ingest (welcome, re-hello, fetch). Legacy unsigned policies are
+  // rejected — central sends policy_sig alongside policy since 0.7.2.
+  const verified = verifyPolicySignature(policy, sig, cfg.clientId);
+  if (!verified.ok) {
+    const error = /** @type {Error & {code?: string}} */ (
+      new Error(/** @type {string} */ (verified.error))
+    );
+    error.code = /** @type {string} */ (verified.error);
     throw error;
   }
   const checked = validatePolicy(policy, cfg.clientId);
@@ -647,7 +661,7 @@ async function fetchCurrentPolicy() {
       undefined,
       7000
     );
-    return applyCurrentPolicy(body?.policy);
+    return applyCurrentPolicy(body?.policy, body?.policy_sig);
   } catch (error) {
     const errRec = error && typeof error === 'object' ? error : null;
     if (errRec && 'code' in errRec && errRec.code) throw error;
@@ -1551,7 +1565,7 @@ async function runSessionOnce(state) {
       try {
         // Re-hellos (capability re-announce) also refresh a stale policy
         // when the hub sends a newer revision.
-        const p = m?.policy ? applyCurrentPolicy(m.policy) : null;
+        const p = m?.policy ? applyCurrentPolicy(m.policy, m.policy_sig) : null;
         if (p && (!currentPolicy || Number(p.revision) >= Number(currentPolicy.revision || 0)))
           currentPolicy = p;
       } catch {}
@@ -1600,7 +1614,7 @@ async function runSessionOnce(state) {
     .finally(() => {
       ws.removeListener('error', preWelcomeError);
     });
-  currentPolicy = w?.policy ? applyCurrentPolicy(w.policy) : null;
+  currentPolicy = w?.policy ? applyCurrentPolicy(w.policy, w.policy_sig) : null;
   liveSession = ws;
   await resetRetirementEvidence(state);
   await log('info', 'session_connected', {

@@ -360,3 +360,70 @@ export function policyBindingRecord(job) {
     admission_origin: origin
   };
 }
+
+/**
+ * Operator policy-signature pins (SYN-POL-001). kid → SPKI PEM. Rotation adds
+ * a new kid here via agent update BEFORE central starts signing with it; old
+ * kids stay until no signed envelope in the wild references them.
+ */
+export const POLICY_VERIFY_KEYS = Object.freeze({
+  'hhc-policy-v1':
+    '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA03tlTmMHj60dcA+vQIwMcQjFLa2h7fyWVt8s66PAPsY=\n-----END PUBLIC KEY-----\n'
+});
+export const POLICY_SIG_TTL_MS = 24 * 3600 * 1000;
+export const POLICY_SIG_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * Verify a central policy-signature envelope against the policy object.
+ * The envelope travels as a SIBLING of `policy` (never inside it — the
+ * structural validator is key-strict and old agents must keep ignoring it).
+ * @param {unknown} policy policy object as received
+ * @param {unknown} sig envelope `{v,kid,issued_at,expires_at,sig}`
+ * @param {string} clientId expected owner (binding)
+ * @param {{nowMs?: number, keys?: Record<string,string>}} [options]
+ */
+export function verifyPolicySignature(
+  policy,
+  sig,
+  clientId,
+  { nowMs = Date.now(), keys = POLICY_VERIFY_KEYS } = {}
+) {
+  if (!isObject(sig)) return { ok: false, error: 'HOST_POLICY_UNSIGNED' };
+  const { v, kid, issued_at, expires_at, sig: b64 } = /** @type {Record<string, unknown>} */ (sig);
+  if (v !== 1) return { ok: false, error: 'HOST_POLICY_BAD_SIGNATURE' };
+  const pem = typeof kid === 'string' ? keys[kid] : undefined;
+  if (typeof pem !== 'string' || !pem) return { ok: false, error: 'HOST_POLICY_UNKNOWN_KEY' };
+  let payload;
+  try {
+    payload = canonicalPolicyPayload(policy);
+  } catch {
+    return { ok: false, error: 'HOST_POLICY_NOT_READY' };
+  }
+  let body;
+  try {
+    body = JSON.parse(payload);
+  } catch {
+    return { ok: false, error: 'HOST_POLICY_NOT_READY' };
+  }
+  if (body.client_id !== clientId) return { ok: false, error: 'HOST_POLICY_NOT_READY' };
+  const issued = Date.parse(String(issued_at || ''));
+  const expires = Date.parse(String(expires_at || ''));
+  if (!Number.isFinite(issued) || !Number.isFinite(expires))
+    return { ok: false, error: 'HOST_POLICY_BAD_SIGNATURE' };
+  if (expires - issued > POLICY_SIG_TTL_MS + POLICY_SIG_SKEW_MS)
+    return { ok: false, error: 'HOST_POLICY_BAD_SIGNATURE' };
+  if (nowMs + POLICY_SIG_SKEW_MS < issued || nowMs - POLICY_SIG_SKEW_MS > expires)
+    return { ok: false, error: 'HOST_POLICY_EXPIRED' };
+  try {
+    const ok = crypto.verify(
+      null,
+      Buffer.from(payload, 'utf8'),
+      crypto.createPublicKey(pem),
+      Buffer.from(String(b64 || ''), 'base64url')
+    );
+    if (!ok) return { ok: false, error: 'HOST_POLICY_BAD_SIGNATURE' };
+  } catch {
+    return { ok: false, error: 'HOST_POLICY_BAD_SIGNATURE' };
+  }
+  return { ok: true };
+}
