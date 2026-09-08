@@ -5,9 +5,9 @@ import fs from 'node:fs';
 test('package version matches client VERSION', async () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url)));
   const { compareAgentVersions } = await import('../src/updater/updater.mjs');
-  assert.equal(typeof compareAgentVersions('0.4.58', '0.4.57'), 'number');
-  assert.ok(compareAgentVersions('0.4.58', '0.4.57') > 0);
-  assert.equal(pkg.version, '0.4.58');
+  assert.equal(typeof compareAgentVersions('0.4.59', '0.4.58'), 'number');
+  assert.ok(compareAgentVersions('0.4.59', '0.4.58') > 0);
+  assert.equal(pkg.version, '0.4.59');
 });
 
 test('policy and contract modules load', async () => {
