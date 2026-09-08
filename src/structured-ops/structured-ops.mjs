@@ -361,6 +361,19 @@ const KNOWN_SERVICE_ALIASES = [
 ];
 
 /**
+ * Whether a service name is queryable via service_status (same allowlist the
+ * status job enforces). Exported so service_list can mark discoverability
+ * without duplicating policy.
+ * @param {unknown} unit
+ * @param {Array<string>} [serviceUnits]
+ */
+export function isServiceStatusAllowed(unit, serviceUnits = []) {
+  const name = String(unit || '').trim();
+  if (!name) return false;
+  return new Set([...serviceUnits, ...KNOWN_SERVICE_ALIASES]).has(name);
+}
+
+/**
  * @param {unknown} job
  * @param {object} [options]
  * @param {Array<string>} [options.serviceUnits]
@@ -374,8 +387,7 @@ export async function serviceStatusJob(
     jobRecord.request_payload || jobRecord.payload || {}
   );
   const unit = String(p.unit || '').trim();
-  const allowed = new Set([...serviceUnits, ...KNOWN_SERVICE_ALIASES]);
-  if (!unit || !allowed.has(unit)) return fail('SERVICE_NOT_ALLOWED');
+  if (!isServiceStatusAllowed(unit, serviceUnits)) return fail('SERVICE_NOT_ALLOWED');
 
   const platform = os.platform();
 
@@ -435,6 +447,7 @@ export async function serviceStatusJob(
       unit === 'hhc-client.service' ||
       unit === 'com.hhc.client' ||
       unit === 'HHC Client' ||
+      unit === 'HHCClient' ||
       unit === 'hhc-client'
         ? 'HHC Client'
         : unit;

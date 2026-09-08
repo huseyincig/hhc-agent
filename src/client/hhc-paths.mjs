@@ -38,6 +38,10 @@ export function hhcLayout(root = defaultHhcRoot(), platform = process.platform) 
     stateFile: join(r, 'data', 'client-state.json'),
     pidFile: join(r, 'data', 'client.pid'),
     lockFile: join(r, 'data', 'client.lock'),
+    // Canonical writable workspace for file mutation tools. The policy root
+    // (layout root) is OS-owned on Unix; this service-owned subtree is the
+    // guaranteed-writable area for directory_create/file_write/file_edit.
+    workspace: join(r, 'data', 'workspace'),
     retiredMarker: join(r, 'data', 'retired.json'),
     updateState: join(r, 'data', 'update-activation.json'),
     clientLog: join(r, 'logs', 'client.log'),

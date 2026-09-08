@@ -578,6 +578,10 @@ export function requiredMutationCapabilities(tool, payload = {}) {
     const v = optionalBoolean(payload, 'create_parents', 'INVALID_CREATE_PARENTS');
     return ['file_write', ...(v ? ['directory_manage'] : [])];
   }
+  // file_edit is a bounded write: same capability as file_write (mirrors the
+  // central requiredCapabilitiesForOperation mapping). Missing branch used to
+  // return [] which the policy gate rejects (deny-by-default on empty).
+  if (tool === 'file_edit') return ['file_write'];
   if (tool === 'directory_create') {
     optionalBoolean(payload, 'parents', 'INVALID_PARENTS');
     return ['directory_manage'];

@@ -2,6 +2,7 @@
 // differences stay here so models only see service_list/start/stop.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { isServiceStatusAllowed } from '../structured-ops/structured-ops.mjs';
 
 const run = promisify(execFile);
 const SERVICE_RE = /^[\w@.\-:]{1,128}$/;
@@ -108,12 +109,20 @@ const fail = (/** @type {unknown} */ error) => ({
 
 /**
  * @param {string} [platform]
+ * @param {object} [options]
+ * @param {Array<string>} [options.serviceUnits]
  */
-export function makeServiceHandlers(platform = process.platform) {
+export function makeServiceHandlers(platform = process.platform, { serviceUnits = [] } = {}) {
   return {
     service_list: async () => {
       try {
-        return ok({ services: await listServices(platform) });
+        const services = await listServices(platform);
+        return ok({
+          services: services.map((s) => ({
+            ...s,
+            queryable: isServiceStatusAllowed(s?.name, serviceUnits)
+          }))
+        });
       } catch (e) {
         const errorRecord = /** @type {{message?: unknown}} */ (e);
         return fail(errorRecord?.message);

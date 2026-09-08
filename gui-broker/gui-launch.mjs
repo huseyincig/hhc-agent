@@ -3,7 +3,71 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { hhcLayout } from '../src/client/hhc-paths.mjs';
 
-const APPS = new Set(['default_browser', 'edge', 'chrome', 'explorer', 'notepad']);
+const APPS = new Set([
+  'default_browser',
+  'edge',
+  'chrome',
+  'explorer',
+  'notepad',
+  'code',
+  'cursor',
+  'terminal'
+]);
+/**
+ * Broker-reported executable stems for PID re-correlation (win32 only).
+ * default_browser launches an unknown browser; terminal may be wt.exe or a
+ * fallback powershell shared with unrelated processes — both are skipped to
+ * avoid attributing a foreign PID.
+ */
+const GUI_EXE_BY_APP = Object.freeze({
+  edge: ['msedge'],
+  chrome: ['chrome'],
+  explorer: ['explorer'],
+  notepad: ['notepad'],
+  code: ['Code'],
+  cursor: ['Cursor']
+});
+/**
+ * Re-correlate a broker-reported GUI PID (win32 only). Single-instance and
+ * Store-packaged apps (Win11 Notepad, browsers) often exit the spawned
+ * launcher and activate another process, leaving a stale PID behind. When
+ * the reported PID is dead, fall back to the newest same-name process;
+ * otherwise (or off Windows) the broker value is returned untouched.
+ * @param {string} app
+ * @param {unknown} pid
+ * @param {string} [platform]
+ */
+export async function resolveGuiPid(app, pid, platform = process.platform) {
+  const id = Number(pid);
+  if (platform !== 'win32') return Number.isInteger(id) && id > 0 ? id : null;
+  const names = /** @type {Record<string, Array<string>>} */ (GUI_EXE_BY_APP)[app];
+  try {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const run = promisify(execFile);
+    const ps = async (/** @type {string} */ script) => {
+      const { stdout } = await run(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', script],
+        { timeout: 15000, windowsHide: true }
+      );
+      return String(stdout || '').trim();
+    };
+    if (Number.isInteger(id) && id > 0) {
+      const probe = await ps(
+        `$p = Get-Process -Id ${id} -ErrorAction SilentlyContinue; if ($p) { 'ALIVE' } else { 'DEAD' }`
+      );
+      if (probe.includes('ALIVE')) return id;
+    }
+    if (!names) return Number.isInteger(id) && id > 0 ? id : null;
+    const found = await ps(
+      `$c = Get-Process -Name ${names.join(',')} -ErrorAction SilentlyContinue | Sort-Object StartTime -Descending | Select-Object -First 1; if ($c) { $c.Id } else { '' }`
+    );
+    const remapped = Number(found);
+    if (Number.isInteger(remapped) && remapped > 0) return remapped;
+  } catch {}
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
 /**
  * @param {unknown} result_payload
  */
@@ -123,7 +187,7 @@ export function makeGuiLaunchHandler({ layout = hhcLayout(), platform = process.
               target,
               user: r.username,
               session_id: r.session_id,
-              pid: r.pid ?? null
+              pid: await resolveGuiPid(app, r.pid, platform)
             }),
             duration_ms: Date.now() - started
           };

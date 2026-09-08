@@ -53,7 +53,7 @@ import { makeServiceHandlers } from '../services/service-ops.mjs';
 import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.59';
+const VERSION = '0.4.60';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),
@@ -1098,7 +1098,9 @@ export function getHandlers() {
     base = makeStructuredHandlers(options),
     mutations = makeMutationHandlers({ writeRoots: [layout.root], policyGate: mutationPolicyGate }),
     processes = makeProcessHandlers({ stateDir: layout.data }),
-    services = makeServiceHandlers(),
+    services = makeServiceHandlers(process.platform, {
+      serviceUnits: cfg.serviceStatusUnits
+    }),
     logFollow = makeLogFollowHandlers({
       logSources: Object.fromEntries(
         Object.entries(LOG_SOURCES).filter(([, v]) => typeof v === 'string' && v)
@@ -1756,6 +1758,10 @@ export async function main() {
   await fs.mkdir(layout.releases, { recursive: true });
   await fs.mkdir(layout.backups, { recursive: true });
   await fs.mkdir(layout.tmp, { recursive: true });
+  // Canonical writable workspace (service-owned by construction). Heals
+  // existing installs via OTA: no reinstall needed for file mutation tools
+  // to gain a writable area.
+  await fs.mkdir(layout.workspace, { recursive: true });
   try {
     await fs.access(layout.retiredMarker);
     retired = true;
