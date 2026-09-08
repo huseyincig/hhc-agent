@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { hhcLayout } from '../client/hhc-paths.mjs';
 
@@ -183,7 +184,7 @@ export async function loadPlaywrightCore(coreDir) {
     try {
       const full = path.join(coreDir, entry);
       if (!fs.existsSync(full)) continue;
-      mod = await import(full);
+      mod = await import(pathToFileURL(full).href);
       break;
     } catch {
       mod = null;
@@ -478,29 +479,72 @@ export function convergenceRetryDelay(attempt = 1, rand = Math.random) {
 }
 
 /**
+ * Pure validate-retry decision for convergence (SYN-BRW-003).
+ * @param {{stage?: unknown, validateFails?: number}} [options]
+ */
+export function convergenceValidateOutcome({ stage = null, validateFails = 0 } = {}) {
+  const fails = stage === 'validate' ? validateFails + 1 : validateFails;
+  if (stage === 'validate' && fails > 3) {
+    return { fails, terminal: true, note: 'PLATFORM_BROWSER_FIX_NEEDED' };
+  }
+  return { fails, terminal: false, note: null };
+}
+
+/**
  * Fire-and-forget background retry for failed convergence (SYN-BRW-003).
  * A single download/validation failure (transient CDN, slow disk) must not
  * defer browsers to the next process restart. Retries back off exponentially
  * with jitter, never run concurrently, and stop permanently on success.
  * Staging-dir collisions with OTA are avoided by skipping while staging
  * exists. Timer is unref'd (never holds the process open).
- * @param {{base?: string|null, attempt?: number, onResult?: ((r: unknown) => unknown)|null}} [options]
+ * Validate-stage failures are NOT retried forever: three consecutive
+ * validate failures mean a deterministic platform problem (missing OS
+ * deps, sandbox, quarantine) that re-downloading will never fix — stop
+ * after 3 and report PLATFORM_BROWSER_FIX_NEEDED instead of burning
+ * bandwidth in a download→validate→wipe loop. Download-stage failures
+ * keep retrying (transient) without touching the validate counter.
+ * @param {{base?: string|null, attempt?: number, validateFails?: number, onResult?: ((r: unknown) => unknown)|null}} [options]
  */
-export function scheduleConvergenceRetry({ base = null, attempt = 1, onResult = null } = {}) {
+export function scheduleConvergenceRetry({
+  base = null,
+  attempt = 1,
+  validateFails = 0,
+  onResult = null
+} = {}) {
   if (!base) return null;
   const delay = convergenceRetryDelay(attempt);
   const timer = setTimeout(() => {
     (async () => {
       try {
         if (fs.existsSync(path.join(base, 'playwright-browsers.staging'))) return;
-        const r = await ensureManagedBrowsers(base);
+        const r = /** @type {{installed?: unknown, error?: unknown, stage?: unknown}} */ (
+          await ensureManagedBrowsers(base)
+        );
         if (onResult) {
           try {
             await onResult(r);
           } catch {}
         }
-        if (!r || r.installed !== true)
-          scheduleConvergenceRetry({ base, attempt: attempt + 1, onResult });
+        if (!r || r.installed === true) return;
+        const outcome = convergenceValidateOutcome({ stage: r.stage, validateFails });
+        if (outcome.terminal) {
+          if (onResult) {
+            try {
+              await onResult({
+                ...r,
+                terminal: true,
+                note: outcome.note
+              });
+            } catch {}
+          }
+          return;
+        }
+        scheduleConvergenceRetry({
+          base,
+          attempt: attempt + 1,
+          validateFails: outcome.fails,
+          onResult
+        });
       } catch {}
     })();
   }, delay);
