@@ -52,7 +52,7 @@ import { makeServiceHandlers } from '../services/service-ops.mjs';
 import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.47';
+const VERSION = '0.4.48';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),
@@ -1524,6 +1524,24 @@ async function runSessionOnce(state) {
       rejectWelcome = j;
     }),
     timer = setTimeout(() => rejectWelcome(new Error('WELCOME_TIMEOUT')), 10000);
+  // Dead-peer detection (SYN-TRANS-001): every ping we send arms a 10s
+  // window; ANY inbound frame disarms it. A half-open socket that swallows
+  // pings trips the window → destroy → existing close/error path →
+  // backoff reconnect. No behavior change on healthy links.
+  // NOTE: created BEFORE the 'json' handler below registers — the handler
+  // calls watchdog.poke() on every inbound frame including the welcome,
+  // which arrives while runSessionOnce is suspended at `await welcome`,
+  // i.e. before any later declaration would initialize (TDZ ReferenceError
+  // would otherwise surface as INVALID_JSON on every connect).
+  const watchdog = attachPongWatchdog({
+    onTimeout: () => {
+      log('error', 'session_pong_timeout', { after_ms: PONG_TIMEOUT_MS }).catch(() => {});
+      try {
+        if (typeof ws.destroy === 'function') ws.destroy('pong timeout');
+        else ws.close(4001, 'pong timeout');
+      } catch {}
+    }
+  });
   ws.on('json', (m) => {
     watchdog.poke();
     if (m.type === 'welcome') {
@@ -1574,19 +1592,6 @@ async function runSessionOnce(state) {
   });
   await markUpdateHealthy(layout, VERSION);
   await flushSessionPending(state, ws);
-  // Dead-peer detection (SYN-TRANS-001): every ping we send arms a 10s
-  // window; ANY inbound frame disarms it. A half-open socket that swallows
-  // pings trips the window → destroy → existing close/error path →
-  // backoff reconnect. No behavior change on healthy links.
-  const watchdog = attachPongWatchdog({
-    onTimeout: () => {
-      log('error', 'session_pong_timeout', { after_ms: PONG_TIMEOUT_MS }).catch(() => {});
-      try {
-        if (typeof ws.destroy === 'function') ws.destroy('pong timeout');
-        else ws.close(4001, 'pong timeout');
-      } catch {}
-    }
-  });
   const hb = Math.max(5, Number(w.heartbeat_interval_seconds || 30)) * 1000,
     h = setInterval(() => {
       try {
