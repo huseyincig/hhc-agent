@@ -48,12 +48,12 @@ import {
   browserUploadJob,
   browserHealth
 } from '../browser/browser-adapter.mjs';
-import { makeProcessHandlers } from '../process/process-sessions.mjs';
+import { makeProcessHandlers, sweepOrphanedSessions } from '../process/process-sessions.mjs';
 import { makeServiceHandlers } from '../services/service-ops.mjs';
 import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.51';
+const VERSION = '0.4.52';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),
@@ -1097,7 +1097,7 @@ export function getHandlers() {
   const options = { readRoots: cfg.readRoots, serviceUnits: cfg.serviceStatusUnits },
     base = makeStructuredHandlers(options),
     mutations = makeMutationHandlers({ writeRoots: [layout.root], policyGate: mutationPolicyGate }),
-    processes = makeProcessHandlers(),
+    processes = makeProcessHandlers({ stateDir: layout.data }),
     services = makeServiceHandlers(),
     logFollow = makeLogFollowHandlers({
       logSources: Object.fromEntries(
@@ -1765,6 +1765,14 @@ export async function main() {
     if (/** @type {Record<string, unknown>} */ (error)?.code !== 'ENOENT') throw error;
   }
   await fs.writeFile(layout.pidFile, String(process.pid) + '\n', { mode: 0o640 });
+  try {
+    // SYN-PROC-004: adopt-or-kill processes recorded by a previous agent
+    // incarnation (detached children survive agent death). Verified kills
+    // only; unverifiable records are left for the next boot, never killed.
+    const swept = await sweepOrphanedSessions({ stateDir: layout.data });
+    if (swept.length)
+      await log('info', 'process_orphan_sweep', { swept: swept.length, actions: swept });
+  } catch {}
   const state = await readState();
   if (markInterruptedJobs(state)) await writeState(state);
   try {
