@@ -5,9 +5,9 @@ import {
   BROWSER_DEFAULTS,
   BROWSER_RUNTIME_PIN,
   resolveBrowserRuntime,
+  resolveChromiumExecutable,
   loadPlaywrightCore,
   applyBrowsersPathEnv,
-  validateBrowserLaunch,
   ensureDir,
   expectedChromiumRevision
 } from './browser-runtime.mjs';
@@ -292,7 +292,6 @@ export class BrowserManager {
     this.managedBrowsers = new Map();
     /** @type {Map<string, string>} */
     this.profileLocks = new Map();
-    this.launchValidated = false;
     this.sweeper = null;
     this.shuttingDown = false;
   }
@@ -385,16 +384,6 @@ export class BrowserManager {
       this.managedBrowsers.delete(key);
     }
     const core = await this.coreApi();
-    if (!this.launchValidated) {
-      const probe = await validateBrowserLaunch({
-        coreDir: this.rt.coreDir,
-        browsersDir: this.rt.browsersDir,
-        headless: key === 'headless',
-        timeoutMs: 60000
-      });
-      if (!probe.ok) throw new Error(probe.error || 'BROWSER_LAUNCH_FAILED');
-      this.launchValidated = true;
-    }
     const launchArgs = [
       '--no-first-run',
       '--no-default-browser-check',
@@ -410,17 +399,32 @@ export class BrowserManager {
     ];
     // NOTE: no --no-sandbox by policy. Sandbox stays enabled; deployments
     // that truly need otherwise must document and gate it explicitly.
+    // SYN-BRW-002: resolve the executable ourselves (deterministic fs check)
+    // instead of trusting Playwright's process-global registry memoization.
+    const resolved = resolveChromiumExecutable({
+      browsersDir: this.rt.browsersDir,
+      headless: key === 'headless'
+    });
+    if (!resolved.ok || !resolved.executablePath) {
+      throw Object.assign(new Error('BROWSER_INSTALLATION_MISSING'), {
+        detail: { tried: resolved.tried, browsersDir: this.rt.browsersDir }
+      });
+    }
     let browser = null;
     try {
       browser = await core.chromium.launch({
         headless: key === 'headless',
+        executablePath: resolved.executablePath,
         timeout: 60000,
         args: launchArgs
       });
     } catch (e) {
       const msg = e && typeof e === 'object' && 'message' in e ? String(e.message) : '';
       if (/executable doesn't exist|Executable doesn't exist/i.test(msg))
-        throw Object.assign(new Error('BROWSER_INSTALLATION_MISSING'), { cause: e });
+        throw Object.assign(new Error('BROWSER_INSTALLATION_MISSING'), {
+          cause: e,
+          detail: { tried: resolved.tried, browsersDir: this.rt.browsersDir }
+        });
       throw Object.assign(new Error('BROWSER_LAUNCH_FAILED'), { cause: e });
     }
     try {
@@ -491,8 +495,18 @@ export class BrowserManager {
       ensureDir(this.rt.profilesDir);
       let context = null;
       try {
+        const resolvedProfile = resolveChromiumExecutable({
+          browsersDir: this.rt.browsersDir,
+          headless: session.headless
+        });
+        if (!resolvedProfile.ok || !resolvedProfile.executablePath) {
+          throw Object.assign(new Error('BROWSER_INSTALLATION_MISSING'), {
+            detail: { tried: resolvedProfile.tried, browsersDir: this.rt.browsersDir }
+          });
+        }
         context = await core.chromium.launchPersistentContext(userDataDir, {
           headless: session.headless,
+          executablePath: resolvedProfile.executablePath,
           viewport: session.viewport,
           ...(session.locale ? { locale: session.locale } : {}),
           ...(session.timezone ? { timezoneId: session.timezone } : {}),
@@ -505,6 +519,7 @@ export class BrowserManager {
       } catch (e) {
         this.profileLocks.delete(profileId);
         const msg = e && typeof e === 'object' && 'message' in e ? String(e.message) : '';
+        if (/^BROWSER_[A-Z_]+/.test(msg)) throw e;
         if (/executable doesn't exist|Executable doesn't exist/i.test(msg))
           throw Object.assign(new Error('BROWSER_INSTALLATION_MISSING'), { cause: e });
         throw Object.assign(new Error('BROWSER_LAUNCH_FAILED'), { cause: e });

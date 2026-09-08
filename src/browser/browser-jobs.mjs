@@ -344,18 +344,35 @@ export async function browserNavigateJob(job) {
         } catch (e) {
           s.state = 'ready';
           const code = mapBrowserError(e, 'navigate');
+          const errRec = /** @type {Record<string, unknown>|null} */ (
+            e && typeof e === 'object' ? e : null
+          );
+          const detail =
+            errRec && typeof errRec.detail === 'object' && errRec.detail !== null
+              ? /** @type {Record<string, unknown>} */ (errRec.detail)
+              : null;
           return failJob(started, code, {
             ...(key !== DEFAULT_SESSION ? { browser_id: key } : {}),
-            url: auditProjectionUrl(String(p.url || ''))
+            url: auditProjectionUrl(String(p.url || '')),
+            ...(detail ? { launch_detail: detail } : {})
           });
         }
       })
     );
   } catch (e) {
+    const errRec = /** @type {Record<string, unknown>|null} */ (
+      e && typeof e === 'object' ? e : null
+    );
+    const detail =
+      errRec && typeof errRec.detail === 'object' && errRec.detail !== null
+        ? /** @type {Record<string, unknown>} */ (errRec.detail)
+        : null;
     return failJob(
       started,
       mapBrowserError(e, 'navigate'),
-      key !== DEFAULT_SESSION ? { browser_id: key } : {}
+      key !== DEFAULT_SESSION
+        ? { browser_id: key, ...(detail ? { launch_detail: detail } : {}) }
+        : { ...(detail ? { launch_detail: detail } : {}) }
     );
   }
 }

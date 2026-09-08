@@ -48,6 +48,97 @@ function readJsonFile(dir, name) {
 }
 
 /**
+ * Deterministic Chromium executable resolution (SYN-BRW-002). Playwright
+ * resolves the binary through process-global registry state (memoized at
+ * first import/launch), which makes launches hostage to import order and
+ * early env values. HHC resolves the exact file itself with plain fs checks
+ * and passes executablePath explicitly, so a launch can never consult stale
+ * registry state. Returns the first hit plus the full tried list for
+ * diagnostics (surfaced on launch failure).
+ * Layout mirrors Playwright 1.63 EXECUTABLE_PATHS (linux/mac/win, x64/arm64,
+ * headless-shell vs full, with legacy chrome-linux fallback).
+ * @param {{browsersDir?: string|null, revision?: string|null, headless?: boolean, platform?: string, arch?: string}} [options]
+ */
+export function resolveChromiumExecutable({
+  browsersDir = null,
+  revision = null,
+  headless = true,
+  platform = process.platform,
+  arch = process.arch
+} = {}) {
+  const tried = [];
+  const rev = String(revision || BROWSER_RUNTIME_PIN.chromiumRevision || '');
+  const root = String(browsersDir || '');
+  const isMac = platform === 'darwin';
+  const isWin = platform === 'win32';
+  const arm = arch === 'arm64';
+  /** @type {Array<Array<string>>} */
+  let candidates = [];
+  if (headless) {
+    if (isWin)
+      candidates = [
+        [
+          `chromium_headless_shell-${rev}`,
+          'chrome-headless-shell-win64',
+          'chrome-headless-shell.exe'
+        ]
+      ];
+    else if (isMac)
+      candidates = [
+        [
+          `chromium_headless_shell-${rev}`,
+          arm ? 'chrome-headless-shell-mac-arm64' : 'chrome-headless-shell-mac-x64',
+          'chrome-headless-shell'
+        ]
+      ];
+    else
+      candidates = [
+        [
+          `chromium_headless_shell-${rev}`,
+          arm ? 'chrome-headless-shell-linux-arm64' : 'chrome-headless-shell-linux64',
+          'chrome-headless-shell'
+        ]
+      ];
+  } else if (isWin) candidates = [[`chromium-${rev}`, 'chrome-win64', 'chrome.exe']];
+  else if (isMac)
+    candidates = [
+      [
+        `chromium-${rev}`,
+        arm ? 'chrome-mac-arm64' : 'chrome-mac-x64',
+        'Google Chrome for Testing.app',
+        'Contents',
+        'MacOS',
+        'Google Chrome for Testing'
+      ]
+    ];
+  else if (arm) candidates = [[`chromium-${rev}`, 'chrome-linux-arm64', 'chrome']];
+  else
+    candidates = [
+      [`chromium-${rev}`, 'chrome-linux64', 'chrome'],
+      [`chromium-${rev}`, 'chrome-linux', 'chrome']
+    ];
+  if (root) {
+    for (const parts of candidates) {
+      const full = path.join(root, ...parts);
+      tried.push(full);
+      try {
+        const st = fs.statSync(full);
+        if (!st.isFile()) continue;
+        if (!isWin) {
+          try {
+            fs.accessSync(full, fs.constants.X_OK);
+          } catch {
+            continue;
+          }
+        }
+        return { ok: true, executablePath: full, tried };
+      } catch {}
+    }
+  }
+  return { ok: false, executablePath: null, tried };
+}
+
+/**
  * @param {{root?: string|null, dataDir?: string|null, env?: NodeJS.ProcessEnv}} [options]
  */
 export function resolveBrowserRuntime(options = {}) {
