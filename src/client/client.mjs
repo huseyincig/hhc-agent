@@ -52,7 +52,7 @@ import { makeServiceHandlers } from '../services/service-ops.mjs';
 import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.49';
+const VERSION = '0.4.50';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),

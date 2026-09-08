@@ -376,8 +376,20 @@ export function makeProcessHandlers() {
     process_list: async (/** @type {unknown} */ job) => {
       try {
         const p = payloadOf(job);
-        if (p.scope === 'system')
-          return ok({ scope: 'system', processes: await listSystemProcesses() });
+        if (p.scope === 'system') {
+          const all = await listSystemProcesses();
+          const rawLimit = p.limit === undefined || p.limit === null ? NaN : Number(p.limit);
+          const limit = Number.isFinite(rawLimit)
+            ? Math.max(1, Math.min(5000, Math.floor(rawLimit)))
+            : NaN;
+          const processes = Number.isFinite(limit) ? all.slice(0, limit) : all;
+          return ok({
+            scope: 'system',
+            processes,
+            total_count: all.length,
+            truncated: processes.length < all.length
+          });
+        }
         return fail('SCOPE_INVALID');
       } catch (e) {
         const errorRecord = /** @type {{message?: unknown}} */ (e);
