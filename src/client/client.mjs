@@ -52,7 +52,7 @@ import { makeServiceHandlers } from '../services/service-ops.mjs';
 import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.48';
+const VERSION = '0.4.49';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),
@@ -189,6 +189,7 @@ export function reconnectDelayMs(baseSeconds) {
  * @property {(reason?: string) => unknown} [destroy]
  * @property {(event: string, listener: (msg: any) => unknown) => unknown} on
  * @property {(event: string, listener: (msg: any) => unknown) => unknown} once
+ * @property {(event: string, listener: (msg: any) => unknown) => unknown} removeListener
  * @typedef {Object} SessionMessage
  * @property {unknown} [id]
  * @property {unknown} [type]
@@ -1573,6 +1574,12 @@ async function runSessionOnce(state) {
       rejectWelcome(new Error(m.code || m.message || 'SESSION_FATAL'));
   });
   ws.on('protocolError', (e) => rejectWelcome(e));
+  // SYN-TRANS-002: a socket-level 'error' during the welcome window has no
+  // session yet; EventEmitter throws on unhandled 'error', which would crash
+  // the agent process. Route it into the welcome race instead (post-welcome
+  // the dedicated once('error') below owns it; double-reject is a no-op).
+  const preWelcomeError = (/** @type {unknown} */ e) => rejectWelcome(e);
+  ws.once('error', preWelcomeError);
   // Hello reflects current disk state on every (re)connect: a runtime that
   // arrived after boot (OTA, background convergence) advertises without
   // waiting for a process restart. Lightweight (no browser launch).
@@ -1580,7 +1587,19 @@ async function runSessionOnce(state) {
     await refreshBrowserHealth();
   } catch {}
   ws.sendJson(sessionHello());
-  const w = await welcome;
+  const w = await welcome
+    .catch((/** @type {unknown} */ e) => {
+      // SYN-TRANS-002: never leave a dead-but-open socket behind on welcome
+      // failure (FD leak per retry; phantom-live on central). The throw below
+      // preserves the original sessionLoop/backoff behavior.
+      try {
+        ws.close(4000, 'welcome failed');
+      } catch {}
+      throw e;
+    })
+    .finally(() => {
+      ws.removeListener('error', preWelcomeError);
+    });
   currentPolicy = w?.policy ? applyCurrentPolicy(w.policy) : null;
   liveSession = ws;
   await resetRetirementEvidence(state);
