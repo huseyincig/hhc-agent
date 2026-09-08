@@ -347,7 +347,16 @@ export async function stageBrowserInstall(options) {
   });
   if (!probe.ok) {
     rmrf(stagingDir);
-    return { ok: false, error: 'BROWSER_LAUNCH_FAILED', detail: probe.error };
+    return {
+      ok: false,
+      error: 'BROWSER_LAUNCH_FAILED',
+      detail:
+        typeof probe.detail === 'string'
+          ? probe.detail.slice(0, 300)
+          : typeof probe.detail === 'object' && probe.detail !== null
+            ? JSON.stringify(probe.detail).slice(0, 300)
+            : probe.error
+    };
   }
   if (!promote)
     return { ok: true, revision, playwright: BROWSER_RUNTIME_PIN.playwright, staged: true };
@@ -440,7 +449,12 @@ export async function ensureManagedBrowsers(base) {
         installed: false,
         error: staged.error || 'BROWSER_INSTALLATION_MISSING',
         stage: staged.error === 'BROWSER_LAUNCH_FAILED' ? 'validate' : 'download',
-        detail: typeof staged.detail === 'string' ? staged.detail.slice(0, 300) : undefined
+        detail:
+          typeof staged.detail === 'string'
+            ? staged.detail.slice(0, 300)
+            : staged.detail && typeof staged.detail === 'object'
+              ? JSON.stringify(staged.detail).slice(0, 300)
+              : undefined
       };
     return { installed: true, revision: staged.revision || revision };
   } catch {
