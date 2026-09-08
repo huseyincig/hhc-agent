@@ -411,10 +411,11 @@ export async function activateBundledBrowserRuntime({ appDir, base }) {
  * the bundled/standalone runtime JS; the ~150 MB binary follows on first
  * boot when missing). Never blocks boot or hello: browser tools stay hidden
  * behind the health gate until the binary validates. No OS dependencies are
- * ever installed here (installer-only); download failures just retry on the
- * next boot and are logged.
+ * ever installed here (installer-only); failures carry stage/detail so the
+ * cause is diagnosable, and scheduleConvergenceRetry re-attempts in-process
+ * instead of waiting for the next restart.
  * @param {string} base
- * @returns {Promise<{installed: boolean, revision?: string, error?: string}>}
+ * @returns {Promise<{installed: boolean, revision?: string, error?: string, stage?: string, detail?: string}>}
  */
 export async function ensureManagedBrowsers(base) {
   try {
@@ -426,7 +427,7 @@ export async function ensureManagedBrowsers(base) {
       return { installed: true, revision };
     const coreDir = path.join(base, 'browser-runtime', 'playwright-core');
     if (!fs.existsSync(path.join(coreDir, 'cli.js')))
-      return { installed: false, error: 'BROWSER_RUNTIME_MISSING' };
+      return { installed: false, error: 'BROWSER_RUNTIME_MISSING', stage: 'preflight' };
     const staged = await stageBrowserInstall({
       coreDir,
       browsersDir,
@@ -435,11 +436,62 @@ export async function ensureManagedBrowsers(base) {
       promote: true
     });
     if (!staged.ok)
-      return { installed: false, error: staged.error || 'BROWSER_INSTALLATION_MISSING' };
+      return {
+        installed: false,
+        error: staged.error || 'BROWSER_INSTALLATION_MISSING',
+        stage: staged.error === 'BROWSER_LAUNCH_FAILED' ? 'validate' : 'download',
+        detail: typeof staged.detail === 'string' ? staged.detail.slice(0, 300) : undefined
+      };
     return { installed: true, revision: staged.revision || revision };
   } catch {
-    return { installed: false, error: 'BROWSER_INTERNAL_ERROR' };
+    return { installed: false, error: 'BROWSER_INTERNAL_ERROR', stage: 'unknown' };
   }
+}
+
+export const CONVERGENCE_RETRY_BASE_MS = 5 * 60 * 1000;
+export const CONVERGENCE_RETRY_MAX_MS = 60 * 60 * 1000;
+
+/**
+ * @param {number} attempt 1-based
+ * @param {() => number} [rand]
+ */
+export function convergenceRetryDelay(attempt = 1, rand = Math.random) {
+  return Math.min(
+    CONVERGENCE_RETRY_MAX_MS,
+    CONVERGENCE_RETRY_BASE_MS * 2 ** Math.min(Math.max(1, attempt) - 1, 4) +
+      Math.floor((typeof rand === 'function' ? rand() : Math.random()) * 60 * 1000)
+  );
+}
+
+/**
+ * Fire-and-forget background retry for failed convergence (SYN-BRW-003).
+ * A single download/validation failure (transient CDN, slow disk) must not
+ * defer browsers to the next process restart. Retries back off exponentially
+ * with jitter, never run concurrently, and stop permanently on success.
+ * Staging-dir collisions with OTA are avoided by skipping while staging
+ * exists. Timer is unref'd (never holds the process open).
+ * @param {{base?: string|null, attempt?: number, onResult?: ((r: unknown) => unknown)|null}} [options]
+ */
+export function scheduleConvergenceRetry({ base = null, attempt = 1, onResult = null } = {}) {
+  if (!base) return null;
+  const delay = convergenceRetryDelay(attempt);
+  const timer = setTimeout(() => {
+    (async () => {
+      try {
+        if (fs.existsSync(path.join(base, 'playwright-browsers.staging'))) return;
+        const r = await ensureManagedBrowsers(base);
+        if (onResult) {
+          try {
+            await onResult(r);
+          } catch {}
+        }
+        if (!r || r.installed !== true)
+          scheduleConvergenceRetry({ base, attempt: attempt + 1, onResult });
+      } catch {}
+    })();
+  }, delay);
+  if (timer.unref) timer.unref();
+  return timer;
 }
 
 /**
@@ -565,7 +617,7 @@ export async function validateBrowserLaunch(options) {
     const msg = e && typeof e === 'object' && 'message' in e ? String(e.message) : '';
     if (/executable doesn't exist|Executable doesn't exist/i.test(msg))
       return { ok: false, error: 'BROWSER_INSTALLATION_MISSING' };
-    return { ok: false, error: 'BROWSER_LAUNCH_FAILED' };
+    return { ok: false, error: 'BROWSER_LAUNCH_FAILED', detail: msg.slice(0, 300) || undefined };
   }
 }
 

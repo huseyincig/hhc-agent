@@ -53,7 +53,7 @@ import { makeServiceHandlers } from '../services/service-ops.mjs';
 import { makeLogFollowHandlers } from '../logs/log-ops.mjs';
 import { executeShellJob, normalizedJobPayload } from '../shell/shell.mjs';
 
-const VERSION = '0.4.55';
+const VERSION = '0.4.56';
 const layout = hhcLayout();
 const cfg = {
   serverUrl: (process.env.HHC_SERVER_URL || 'https://mcp.hhc.zone').replace(/\/$/, ''),
@@ -1788,16 +1788,37 @@ export async function main() {
     // Converge the Chromium binary in the background (see
     // ensureManagedBrowsers): boot and hello never wait for the download.
     // When convergence newly completes, re-announce so the hub learns the
-    // browser tools without waiting for a reconnect.
+    // browser tools without waiting for a reconnect. A failed first attempt
+    // schedules bounded backoff retries in-process (SYN-BRW-003) instead of
+    // waiting for the next restart.
     import('../browser/browser-runtime.mjs')
-      .then((m) => m.ensureManagedBrowsers(rtBase))
-      .then(async (r) => {
+      .then(async (m) => {
+        const r = /** @type {{installed?: unknown}} */ (await m.ensureManagedBrowsers(rtBase));
         await log('info', 'browser_binary_convergence', { ...r });
         if (r.installed && !browserHealthCache.available) {
           try {
             await refreshBrowserHealth();
           } catch {}
           if (browserHealthCache.available) announceCapabilities();
+        }
+        if (!r.installed) {
+          try {
+            m.scheduleConvergenceRetry({
+              base: rtBase,
+              onResult: async (rr) => {
+                const rec = /** @type {{installed?: unknown}} */ (
+                  typeof rr === 'object' && rr !== null ? rr : {}
+                );
+                await log('info', 'browser_binary_convergence_retry', { ...rec });
+                if (rec.installed && !browserHealthCache.available) {
+                  try {
+                    await refreshBrowserHealth();
+                  } catch {}
+                  if (browserHealthCache.available) announceCapabilities();
+                }
+              }
+            });
+          } catch {}
         }
       })
       .catch(() => {});
