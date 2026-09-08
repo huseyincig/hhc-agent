@@ -506,12 +506,26 @@ export async function activateStagedBrowserRuntime(base) {
 
 /**
  * Launch validation: blank page open + title read + clean close.
+ * Uses explicit executable resolution (same determinism rationale as the
+ * manager: never trust registry memoization for validation verdicts).
  * @param {{coreDir: string, browsersDir: string, headless?: boolean, timeoutMs?: number}} options
  */
 export async function validateBrowserLaunch(options) {
   const started = Date.now();
   applyBrowsersPathEnv(options.browsersDir);
   const timeoutMs = options.timeoutMs || 60000;
+  const headless = options.headless !== false;
+  const resolved = resolveChromiumExecutable({
+    browsersDir: options.browsersDir,
+    headless
+  });
+  if (!resolved.ok || !resolved.executablePath) {
+    return {
+      ok: false,
+      error: 'BROWSER_INSTALLATION_MISSING',
+      detail: { tried: resolved.tried, browsersDir: options.browsersDir }
+    };
+  }
   let core = null;
   try {
     core = await loadPlaywrightCore(options.coreDir);
@@ -526,7 +540,8 @@ export async function validateBrowserLaunch(options) {
   let browser = null;
   try {
     browser = await core.chromium.launch({
-      headless: options.headless !== false,
+      headless,
+      executablePath: resolved.executablePath,
       timeout: Math.min(timeoutMs, 60000),
       args: ['--no-first-run', '--no-default-browser-check', '--disable-dev-shm-usage']
     });
@@ -565,9 +580,13 @@ export async function browserHealth(options = {}) {
   const browsersDir = options.browsersDir || rt.browsersDir;
   let version = null;
   try {
-    const core = await loadPlaywrightCore(coreDir);
-    version = core ? core.__version : null;
-    if (!core) throw new Error('BROWSER_RUNTIME_MISSING');
+    // SYN-BRW-002: read the version from package.json — NEVER import the
+    // core here. Importing memoizes Playwright's browsers-dir registry from
+    // the ambient env (unset this early in boot), which would then poison
+    // every later launch in the process even after the env is set correctly.
+    const pkg = readJsonFile(coreDir, 'package.json');
+    version = pkg && typeof pkg.version === 'string' ? pkg.version : null;
+    if (!version) throw new Error('BROWSER_RUNTIME_MISSING');
   } catch (e) {
     return {
       available: false,
