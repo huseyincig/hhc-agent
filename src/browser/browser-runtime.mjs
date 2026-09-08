@@ -615,6 +615,44 @@ export async function activateStagedBrowserRuntime(base) {
 }
 
 /**
+ * Service-user browser HOME (SYN-BRW-004). Chromium CHECK-traps (SIGILL,
+ * empty stderr, "browser has been closed") when the daemon user's HOME is
+ * missing or unwritable — e.g. macOS `_hhc` whose NFSHomeDirectory is
+ * /var/empty. Healthy hosts keep their ambient HOME untouched; only an
+ * unwritable HOME falls back to a managed 0700 dir under the data tree.
+ * @param {{browsersDir?: string|null, home?: string}} [options]
+ */
+export function resolveBrowserServiceHome({ browsersDir = null, home = undefined } = {}) {
+  const ambient = home === undefined ? process.env.HOME : home;
+  if (typeof ambient === 'string' && ambient) {
+    try {
+      fs.accessSync(ambient, fs.constants.W_OK);
+      return { home: ambient, managed: false };
+    } catch {}
+  }
+  const managed = path.join(
+    browsersDir ? path.dirname(String(browsersDir)) : os.tmpdir(),
+    'browser-service-home'
+  );
+  fs.mkdirSync(managed, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(managed, 0o700);
+  } catch {}
+  return { home: managed, managed: true };
+}
+
+/**
+ * Environment for browser child processes (SYN-BRW-004): process env with
+ * a guaranteed-writable HOME. Playwright's `env` defaults to process.env,
+ * so this is a no-op override on healthy hosts.
+ * @param {{browsersDir?: string|null}} [options]
+ */
+export function browserLaunchEnv({ browsersDir = null } = {}) {
+  const { home } = resolveBrowserServiceHome({ browsersDir });
+  return { ...process.env, HOME: home };
+}
+
+/**
  * Launch validation: blank page open + title read + clean close.
  * Uses explicit executable resolution (same determinism rationale as the
  * manager: never trust registry memoization for validation verdicts).
@@ -653,6 +691,7 @@ export async function validateBrowserLaunch(options) {
       headless,
       executablePath: resolved.executablePath,
       timeout: Math.min(timeoutMs, 60000),
+      env: browserLaunchEnv({ browsersDir: options.browsersDir }),
       args: ['--no-first-run', '--no-default-browser-check', '--disable-dev-shm-usage']
     });
     const ctx = await browser.newContext();

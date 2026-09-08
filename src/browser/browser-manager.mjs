@@ -8,6 +8,7 @@ import {
   resolveChromiumExecutable,
   loadPlaywrightCore,
   applyBrowsersPathEnv,
+  browserLaunchEnv,
   ensureDir,
   expectedChromiumRevision
 } from './browser-runtime.mjs';
@@ -416,6 +417,7 @@ export class BrowserManager {
         headless: key === 'headless',
         executablePath: resolved.executablePath,
         timeout: 60000,
+        env: browserLaunchEnv({ browsersDir: this.rt.browsersDir }),
         args: launchArgs
       });
     } catch (e) {
@@ -507,6 +509,7 @@ export class BrowserManager {
         context = await core.chromium.launchPersistentContext(userDataDir, {
           headless: session.headless,
           executablePath: resolvedProfile.executablePath,
+          env: browserLaunchEnv({ browsersDir: this.rt.browsersDir }),
           viewport: session.viewport,
           ...(session.locale ? { locale: session.locale } : {}),
           ...(session.timezone ? { timezoneId: session.timezone } : {}),
