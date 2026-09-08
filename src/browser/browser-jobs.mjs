@@ -11,6 +11,12 @@ import {
 } from './browser-manager.mjs';
 import { validateEgressUrl, auditProjectionUrl } from '../policy/egress-policy.mjs';
 import { validateBrowserLaunch } from './browser-runtime.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+/** Max retained over-budget captures per browser session (session-close wipes the dir). */
+export const SCREENSHOT_ARTIFACT_KEEP = 5;
 
 /**
  * @typedef {import('./browser-manager.mjs').PWPage} PWPage
@@ -19,6 +25,49 @@ import { validateBrowserLaunch } from './browser-runtime.mjs';
 
 const BID_RE = /^brw_[0-9a-f]{32}$/;
 const DEFAULT_SESSION = 'default';
+
+/**
+ * Persist an over-budget capture instead of destroying it (SYN-BRW-001).
+ * Stored under the session downloads dir so session close sweeps it, capped
+ * to SCREENSHOT_ARTIFACT_KEEP newest files. The model fetches the bytes via
+ * file_read (agent allowlist covers the downloads tree).
+ * @param {{downloadsRoot?: string|null, sessionKey?: string, bytes?: unknown, ext?: string}} [options]
+ */
+export function storeScreenshotArtifact({
+  downloadsRoot = null,
+  sessionKey = DEFAULT_SESSION,
+  bytes = null,
+  ext = 'png'
+} = {}) {
+  if (!downloadsRoot || !Buffer.isBuffer(bytes) || bytes.length === 0)
+    return { ok: false, error: 'BROWSER_ARTIFACT_STORE_FAILED' };
+  const safeExt = ext === 'jpeg' || ext === 'jpg' ? 'jpg' : 'png';
+  const safeKey = /^[A-Za-z0-9_-]{1,64}$/.test(String(sessionKey || ''))
+    ? String(sessionKey)
+    : 'default';
+  try {
+    const dir = path.join(String(downloadsRoot), safeKey);
+    fs.mkdirSync(dir, { recursive: true });
+    const name = `screenshot-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${safeExt}`;
+    const full = path.join(dir, name);
+    fs.writeFileSync(full, bytes, { mode: 0o600 });
+    try {
+      const kept = fs
+        .readdirSync(dir)
+        .filter((f) => f.startsWith('screenshot-') && (f.endsWith('.png') || f.endsWith('.jpg')))
+        .map((f) => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs }))
+        .sort((a, b) => b.t - a.t);
+      for (const stale of kept.slice(SCREENSHOT_ARTIFACT_KEEP)) {
+        try {
+          fs.rmSync(path.join(dir, stale.f), { force: true });
+        } catch {}
+      }
+    } catch {}
+    return { ok: true, artifact_path: full, bytes: bytes.length };
+  } catch {
+    return { ok: false, error: 'BROWSER_ARTIFACT_STORE_FAILED' };
+  }
+}
 
 /**
  * @param {unknown} job
@@ -892,8 +941,21 @@ export async function browserScreenshotJob(job) {
             }
           } catch {}
         }
+        // SYN-BRW-001: persist over-budget captures as retrievable artifacts
+        // instead of destroying the evidence. The model fetches bytes via
+        // file_read; session close sweeps the directory.
+        let artifactPath = null;
+        let originalBytes = b64.length;
         if (b64.length > budget) {
           truncated = true;
+          originalBytes = b64.length;
+          const stored = storeScreenshotArtifact({
+            downloadsRoot: manager.paths().downloadsDir,
+            sessionKey: key,
+            bytes: Buffer.from(buf),
+            ext: usedFormat === 'jpeg' ? 'jpg' : 'png'
+          });
+          if (stored.ok) artifactPath = stored.artifact_path;
           b64 = '';
         }
         const cur = s.currentPage();
@@ -905,11 +967,16 @@ export async function browserScreenshotJob(job) {
             browser_id: key === DEFAULT_SESSION ? null : key,
             page_id: cur?.pageId || null,
             format: usedFormat,
-            bytes: b64.length,
+            bytes: originalBytes,
             truncated,
-            base64: b64 || null
+            base64: b64 || null,
+            artifact_path: artifactPath
           },
-          truncated ? 'Screenshot exceeded budget (truncated)' : 'Screenshot captured'
+          truncated
+            ? artifactPath
+              ? 'Screenshot exceeded budget (stored as artifact)'
+              : 'Screenshot exceeded budget (truncated)'
+            : 'Screenshot captured'
         );
       } catch (e) {
         s.state = 'ready';
